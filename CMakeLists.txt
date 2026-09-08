@@ -9,6 +9,7 @@ find_package(ament_cmake REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(tf2_ros REQUIRED)
 
 find_path(HUMANOID_COMMON_INCLUDE_DIR
   NAMES robot_base.h transport_executor.h
@@ -89,7 +90,34 @@ set_target_properties(humanoid_cmd_vel_hmi_node PROPERTIES
   INSTALL_RPATH "${HUMANOID_COMMON_LIB_DIR}"
 )
 
+set(HUMANOID_TRANSPORT_PACKET_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../../application/native/humanoid_common/src/transport/transport_executor"
+)
+add_executable(humanoid_head_tf_node src/humanoid_head_tf_node.cpp)
+target_include_directories(humanoid_head_tf_node PRIVATE
+  ${HUMANOID_COMMON_INCLUDE_DIR}
+  ${HUMANOID_TRANSPORT_PACKET_DIR}
+)
+set_property(SOURCE src/humanoid_head_tf_node.cpp APPEND PROPERTY
+  OBJECT_DEPENDS "${HUMANOID_TRANSPORT_PACKET_DIR}/transport_packet.h"
+)
+ament_target_dependencies(humanoid_head_tf_node
+  geometry_msgs
+  rclcpp
+  tf2_ros
+)
+target_link_libraries(humanoid_head_tf_node
+  ${ROBOT_BASE_LIB}
+  pthread
+  rt
+)
+set_target_properties(humanoid_head_tf_node PROPERTIES
+  BUILD_RPATH "${HUMANOID_COMMON_LIB_DIR}"
+  INSTALL_RPATH "${HUMANOID_COMMON_LIB_DIR}"
+)
+
 install(TARGETS humanoid_nav_rl_bridge_node humanoid_cmd_vel_hmi_node
+  humanoid_head_tf_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

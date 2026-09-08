@@ -102,6 +102,34 @@ ros2 run humanoid humanoid_cmd_vel_hmi_node \
 
 不要同时启动该节点和 `run_hmi_linglong.sh`，因为二者都是 HMI transport 端。
 
+## LingLong 头部与相机 TF
+
+`humanoid_head_tf_node` 以只读方式旁路观察 LingLong SHM 状态，不会消费
+`control_runtime` 的状态数据，也不会发送控制命令。节点根据实机反馈的
+`head_yaw_joint` 和 `head_pitch_joint` 发布：
+
+```text
+base_link -> head_yaw_link -> head_pitch_link -> camera_link
+```
+
+前两段是动态 TF。相机外参是 `head_pitch_link -> camera_link` 静态 TF，默认关闭；
+测量或标定后通过 `camera_xyz`（米）和 `camera_rpy`（弧度，roll/pitch/yaw）提供：
+
+```bash
+source output/staging/setup.zsh
+ros2 run humanoid humanoid_head_tf_node \
+  "$PWD/application/native/humanoid_linglong/config/linglong.yaml" \
+  --ros-args \
+  -p camera_tf_enabled:=true \
+  -p camera_xyz:="[0.0, 0.0, 0.0]" \
+  -p camera_rpy:="[0.0, 0.0, 0.0]"
+```
+
+把示例中的零外参替换为实测值。可选参数包括 `base_frame`、`yaw_frame`、
+`pitch_frame`、`camera_frame`、`head_mount_xyz`、`publish_rate_hz` 和
+`state_timeout_s`。该节点仅支持 `transport.type: shm`，应与 driver、control
+运行在同一台机器并具有状态共享内存的读取权限。
+
 ## 常见问题
 
 - 状态显示 `control=offline`：确认 driver 和 `control_runtime` 已启动，并使用同一
