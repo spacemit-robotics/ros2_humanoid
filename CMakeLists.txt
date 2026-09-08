@@ -55,7 +55,41 @@ set_target_properties(humanoid_nav_rl_bridge_node PROPERTIES
   INSTALL_RPATH "${HUMANOID_COMMON_LIB_DIR}"
 )
 
-install(TARGETS humanoid_nav_rl_bridge_node
+# Interactive HMI that keeps the native terminal/FSM behavior and accepts
+# geometry_msgs/Twist as an additional velocity input. The native source is
+# included read-only so this target stays behaviorally aligned with hmi_runtime.
+set(HUMANOID_HMI_RUNTIME_SOURCE
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../../application/native/humanoid_common/src/runtime/hmi_runtime.cpp"
+)
+add_executable(humanoid_cmd_vel_hmi_node src/humanoid_cmd_vel_hmi_node.cpp)
+target_include_directories(humanoid_cmd_vel_hmi_node PRIVATE
+  ${HUMANOID_COMMON_INCLUDE_DIR}
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../../application/native/humanoid_common/src/logging"
+)
+target_compile_definitions(humanoid_cmd_vel_hmi_node PRIVATE
+  HUMANOID_HMI_RUNTIME_SOURCE="${HUMANOID_HMI_RUNTIME_SOURCE}"
+)
+set_property(SOURCE src/humanoid_cmd_vel_hmi_node.cpp APPEND PROPERTY
+  OBJECT_DEPENDS
+    "${HUMANOID_HMI_RUNTIME_SOURCE}"
+    "${HUMANOID_COMMON_INCLUDE_DIR}/transport_executor.h"
+    "${TRANSPORT_EXECUTOR_LIB}"
+)
+ament_target_dependencies(humanoid_cmd_vel_hmi_node
+  geometry_msgs
+  rclcpp
+)
+target_link_libraries(humanoid_cmd_vel_hmi_node
+  ${TRANSPORT_EXECUTOR_LIB}
+  ${ROBOT_BASE_LIB}
+  pthread
+)
+set_target_properties(humanoid_cmd_vel_hmi_node PROPERTIES
+  BUILD_RPATH "${HUMANOID_COMMON_LIB_DIR}"
+  INSTALL_RPATH "${HUMANOID_COMMON_LIB_DIR}"
+)
+
+install(TARGETS humanoid_nav_rl_bridge_node humanoid_cmd_vel_hmi_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

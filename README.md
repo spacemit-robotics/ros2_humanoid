@@ -74,6 +74,34 @@ Nav2 /cmd_vel
 参数默认值见 [`config/linglong_nav_rl_bridge.yaml`](config/linglong_nav_rl_bridge.yaml)。
 后续完整接口和部署方式以 SpacemiT Robot 官方文档为准。
 
+## ROS2 cmd_vel 终端 HMI
+
+`humanoid_cmd_vel_hmi_node` 是 `run_hmi_linglong.sh` 的 ROS2 输入版本。它复用
+原 HMI 的终端界面、FSM 状态切换、策略选择、状态确认、心跳和退出保护逻辑，
+并订阅 `/cmd_vel` 更新速度。节点不会通过 ROS2 发布机器人控制消息；控制仍由
+原 HMI transport 发送给 `control_runtime`。
+
+启动 driver 和 control 后，在交互式终端中用该节点替代
+`run_hmi_linglong.sh`：
+
+```bash
+source output/staging/setup.zsh
+ros2 run humanoid humanoid_cmd_vel_hmi_node \
+  "$PWD/application/native/humanoid_linglong/config/linglong.yaml"
+```
+
+可选 ROS2 参数：
+
+```bash
+ros2 run humanoid humanoid_cmd_vel_hmi_node \
+  "$PWD/application/native/humanoid_linglong/config/linglong.yaml" \
+  --ros-args \
+  -p cmd_vel_topic:=/cmd_vel \
+  -p cmd_vel_timeout_s:=0.5
+```
+
+不要同时启动该节点和 `run_hmi_linglong.sh`，因为二者都是 HMI transport 端。
+
 ## 常见问题
 
 - 状态显示 `control=offline`：确认 driver 和 `control_runtime` 已启动，并使用同一
