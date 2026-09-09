@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * @file humanoid_head_tf_node.cpp
- * @brief Publish LingLong head and camera TF from a read-only state SHM tap.
+ * @brief Publish LingLong head TF from a read-only state SHM tap.
  */
 
 #include <fcntl.h>
@@ -28,7 +28,6 @@
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "robot_base.h"
-#include "tf2_ros/static_transform_broadcaster.h"
 #include "tf2_ros/transform_broadcaster.h"
 #include "transport_packet.h"
 
@@ -209,11 +208,7 @@ public:
         base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
         yaw_frame_ = declare_parameter<std::string>("yaw_frame", "head_yaw_link");
         pitch_frame_ = declare_parameter<std::string>("pitch_frame", "head_pitch_link");
-        camera_frame_ = declare_parameter<std::string>("camera_frame", "camera_link");
         head_mount_xyz_ = ReadVectorParameter("head_mount_xyz", {0.0, 0.0, 0.4168});
-        camera_xyz_ = ReadVectorParameter("camera_xyz", {0.0, 0.0, 0.0});
-        camera_rpy_ = ReadVectorParameter("camera_rpy", {0.0, 0.0, 0.0});
-        camera_tf_enabled_ = declare_parameter<bool>("camera_tf_enabled", false);
         publish_rate_hz_ = declare_parameter<double>("publish_rate_hz", 50.0);
         state_timeout_s_ = declare_parameter<double>("state_timeout_s", 0.1);
         if (!std::isfinite(publish_rate_hz_) || publish_rate_hz_ <= 0.0 ||
@@ -223,16 +218,6 @@ public:
         }
 
         dynamic_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
-        static_broadcaster_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
-        if (camera_tf_enabled_)
-        {
-            PublishCameraTransform();
-        }
-        else
-        {
-            RCLCPP_WARN(get_logger(),
-                "camera TF is disabled; set camera_tf_enabled=true and provide camera_xyz/rpy");
-        }
 
         timer_ = create_wall_timer(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -256,20 +241,6 @@ private:
             throw std::runtime_error(name + " must contain three finite values");
         }
         return {values[0], values[1], values[2]};
-    }
-
-    void PublishCameraTransform()
-    {
-        geometry_msgs::msg::TransformStamped transform;
-        transform.header.stamp = now();
-        transform.header.frame_id = pitch_frame_;
-        transform.child_frame_id = camera_frame_;
-        transform.transform.translation.x = camera_xyz_[0];
-        transform.transform.translation.y = camera_xyz_[1];
-        transform.transform.translation.z = camera_xyz_[2];
-        transform.transform.rotation =
-            QuaternionFromRpy(camera_rpy_[0], camera_rpy_[1], camera_rpy_[2]);
-        static_broadcaster_->sendTransform(transform);
     }
 
     void Tick()
@@ -321,11 +292,7 @@ private:
     std::string base_frame_;
     std::string yaw_frame_;
     std::string pitch_frame_;
-    std::string camera_frame_;
     std::array<double, 3> head_mount_xyz_{};
-    std::array<double, 3> camera_xyz_{};
-    std::array<double, 3> camera_rpy_{};
-    bool camera_tf_enabled_ = false;
     double publish_rate_hz_ = 50.0;
     double state_timeout_s_ = 0.1;
     std::size_t yaw_joint_index_ = 0;
@@ -336,7 +303,6 @@ private:
     std::chrono::steady_clock::time_point last_state_time_{};
     std::unique_ptr<StateShmTap> state_tap_;
     std::unique_ptr<tf2_ros::TransformBroadcaster> dynamic_broadcaster_;
-    std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;
 };
 

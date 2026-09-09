@@ -9,7 +9,8 @@
 - `humanoid_cmd_vel_hmi_node`：保留原生 HMI 的界面与 FSM 操作，同时接收 ROS2
   `/cmd_vel`，用于实机 ros2 控制机器人。
 - `humanoid_head_tf_node`：只读获取 LingLong 头部 yaw、pitch 实机关节角度，发布
-  虚拟 `base_link`、头部动态 TF 和可配置的相机静态 TF，无需 URDF，用于实机建图避障场景。
+  虚拟 `base_link` 和头部动态 TF；配套 launch 通过 `tf2_ros` 发布相机静态 TF，
+  无需 URDF，用于实机建图避障场景。
 
 节点复用现有 `transport_executor` 或只读观察其 SHM 状态，不修改
 `control_runtime`、`driver_runtime` 或策略实现。
@@ -113,7 +114,8 @@ ros2 run humanoid humanoid_cmd_vel_hmi_node \
 
 `humanoid_head_tf_node` 以只读方式旁路观察 LingLong SHM 状态，不会消费
 `control_runtime` 的状态数据，也不会发送控制命令。节点根据实机反馈的
-`head_yaw_joint` 和 `head_pitch_joint` 发布：
+`head_yaw_joint` 和 `head_pitch_joint` 发布头部动态 TF；配套 launch 使用
+`tf2_ros/static_transform_publisher` 发布相机静态 TF：
 
 ```text
 base_link -> head_yaw_link -> head_pitch_link -> camera_link
@@ -133,23 +135,34 @@ base_link -> head_yaw_link -> head_pitch_link -> camera_link
 有效实机关节反馈前不会发布上述动态 TF。`head_mount_xyz` 可覆盖默认的
 `[0, 0, 0.4168]`。
 
-相机外参是 `head_pitch_link -> camera_link` 静态 TF，默认关闭；
-测量或标定后通过 `camera_xyz`（米）和 `camera_rpy`（弧度，roll/pitch/yaw）提供：
+相机外参是 `head_pitch_link -> camera_link` 静态 TF，因此相机会同时跟随头部
+yaw 和 pitch 运动。默认值为平移
+`[0.035, 0.039, 0.24]` 米和 RPY `[0.0, 0.523, 0.0]` 弧度。启动完整 TF：
 
 ```bash
 source output/staging/setup.zsh
-ros2 run humanoid humanoid_head_tf_node \
-  "$PWD/application/native/humanoid_linglong/config/linglong.yaml" \
-  --ros-args \
-  -p camera_tf_enabled:=true \
-  -p camera_xyz:="[0.0, 0.0, 0.0]" \
-  -p camera_rpy:="[0.0, 0.0, 0.0]"
+ros2 launch humanoid linglong_head_tf.launch.py \
+  robot_config_path:=$PWD/application/native/humanoid_linglong/config/linglong.yaml
 ```
 
-把示例中的零外参替换为实测值。可选参数包括 `base_frame`、`yaw_frame`、
-`pitch_frame`、`camera_frame`、`head_mount_xyz`、`publish_rate_hz` 和
-`state_timeout_s`。该节点仅支持 `transport.type: shm`，应与 driver、control
-运行在同一台机器并具有状态共享内存的读取权限。
+可通过 launch 参数覆盖相机静态外参和坐标系名称：
+
+```bash
+ros2 launch humanoid linglong_head_tf.launch.py \
+  robot_config_path:=$PWD/application/native/humanoid_linglong/config/linglong.yaml \
+  camera_x:=0.035 camera_y:=0.039 camera_z:=0.24 \
+  camera_roll:=0.0 camera_pitch:=0.523 camera_yaw:=0.0 \
+  camera_parent_frame:=head_pitch_link camera_frame:=camera_link
+```
+
+launch 内部按 ROS2 Humble 的位置参数顺序 `x y z yaw pitch roll parent child`
+启动 `static_transform_publisher`。这里的 `camera_roll`、`camera_pitch` 和
+`camera_yaw` 仍分别表示绕 X、Y、Z 轴的旋转。
+
+动态 TF 节点还支持 `base_frame`、`yaw_frame`、`pitch_frame`、
+`head_mount_xyz`、`publish_rate_hz` 和 `state_timeout_s` 参数。该节点仅支持
+`transport.type: shm`，应与 driver、control 运行在同一台机器并具有状态共享内存
+的读取权限。
 
 启动后可分别检查动态头部 TF 和相机静态 TF：
 
