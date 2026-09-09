@@ -2,10 +2,17 @@
 
 ## 项目简介
 
-`humanoid` 是人形机器人 ROS2 控制集成包。当前提供
-`humanoid_nav_rl_bridge_node`，用于将 Nav2 `/cmd_vel` 速度指令接入现有 RL
-运控链路，复用 `transport_executor` 的 HMI 通道，无需修改 `control_runtime`、
-`driver_runtime` 或策略实现。
+`humanoid` 是人形机器人 ROS2 控制集成包，用于把 ROS2 导航、终端控制和 TF
+接入现有 native 人形机器人运控链路。当前提供三个节点：
+
+- `humanoid_nav_rl_bridge_node`：将 Nav2 `/cmd_vel` 速度指令接入 RL 运控链路，用于mujoco一键仿真。
+- `humanoid_cmd_vel_hmi_node`：保留原生 HMI 的界面与 FSM 操作，同时接收 ROS2
+  `/cmd_vel`，用于实机 ros2 控制机器人。
+- `humanoid_head_tf_node`：只读获取 LingLong 头部 yaw、pitch 实机关节角度，发布
+  虚拟 `base_link`、头部动态 TF 和可配置的相机静态 TF，无需 URDF，用于实机建图避障场景。
+
+节点复用现有 `transport_executor` 或只读观察其 SHM 状态，不修改
+`control_runtime`、`driver_runtime` 或策略实现。
 
 ## 功能特性
 
@@ -112,7 +119,21 @@ ros2 run humanoid humanoid_cmd_vel_hmi_node \
 base_link -> head_yaw_link -> head_pitch_link -> camera_link
 ```
 
-前两段是动态 TF。相机外参是 `head_pitch_link -> camera_link` 静态 TF，默认关闭；
+`base_link` 是该节点创建的 TF 根坐标系，不发布 `world` 或 `odom` 到
+`base_link` 的变换。头部坐标关系为：
+
+- `base_link -> head_yaw_link`：平移为 `[0, 0, 0.4168]` 米，旋转为
+  `Rz(head_yaw_joint)`。即 yaw 关节绕位于 `base_link` 上方 0.4168 米处的 Z 轴
+  旋转；yaw 为零时两坐标系方向一致。
+- `head_yaw_link -> head_pitch_link`：平移为 `[0, 0, 0]`，旋转为
+  `Ry(head_pitch_joint)`。pitch 为零时两个坐标系的原点和方向完全重合；pitch
+  改变后原点仍重合，仅 `head_pitch_link` 绕共同原点的 Y 轴旋转。
+
+旋转正方向遵循右手定则，关节角使用经过硬件极性和零偏标定后的弧度值。节点收到
+有效实机关节反馈前不会发布上述动态 TF。`head_mount_xyz` 可覆盖默认的
+`[0, 0, 0.4168]`。
+
+相机外参是 `head_pitch_link -> camera_link` 静态 TF，默认关闭；
 测量或标定后通过 `camera_xyz`（米）和 `camera_rpy`（弧度，roll/pitch/yaw）提供：
 
 ```bash
@@ -129,6 +150,14 @@ ros2 run humanoid humanoid_head_tf_node \
 `pitch_frame`、`camera_frame`、`head_mount_xyz`、`publish_rate_hz` 和
 `state_timeout_s`。该节点仅支持 `transport.type: shm`，应与 driver、control
 运行在同一台机器并具有状态共享内存的读取权限。
+
+启动后可分别检查动态头部 TF 和相机静态 TF：
+
+```bash
+ros2 run tf2_ros tf2_echo base_link head_yaw_link
+ros2 run tf2_ros tf2_echo head_yaw_link head_pitch_link
+ros2 run tf2_ros tf2_echo head_pitch_link camera_link
+```
 
 ## 常见问题
 
