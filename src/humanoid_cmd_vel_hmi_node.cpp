@@ -53,7 +53,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    auto transport = transport::Create(yaml_path);
+    auto transport = transport::CreateV2(yaml_path);
     if (!transport->Init(yaml_path, transport::Role::HMI)) {
         runtime_logging::Log(runtime_logging::Level::kError,
             "ROS HMI transport initialization failed", false);
@@ -146,11 +146,15 @@ int main(int argc, char *argv[]) {
         }
 
         robot_base::ControlStatus latest_status;
+        robot_base::FaultStatus latest_fault;
         bool received_status = false;
-        while (transport->RecvStatus(latest_status)) received_status = true;
+        while (transport->RecvStatusV2(latest_status, latest_fault))
+            received_status = true;
         if (received_status) {
-            const bool status_changed = StatusChanged(state, latest_status);
-            ProcessStatus(&state, latest_status, now, &send_immediately);
+            const bool status_changed =
+                StatusChanged(state, latest_status, latest_fault);
+            ProcessStatus(
+                &state, latest_status, latest_fault, now, &send_immediately);
             dirty = dirty || status_changed || send_immediately;
         }
 
@@ -168,6 +172,7 @@ int main(int argc, char *argv[]) {
             if (!online) {
                 state.transition.active = false;
                 state.pending_policy.clear();
+                state.fault_ack_sequence = 0;
                 ZeroVelocity(&state);
                 if (state.page == HmiPage::VELOCITY) state.page = HmiPage::MAIN;
                 state.last_action = "Control 状态回传超时，速度已清零";
@@ -337,7 +342,10 @@ int main(int argc, char *argv[]) {
         if (send_immediately ||
             std::chrono::duration<double>(now - last_command_at).count() >=
                 heartbeat_period) {
-            SendCommand(transport.get(), state);
+            if (SendCommand(transport.get(), &state)) {
+                dirty = true;
+                last_logged_action = state.last_action;
+            }
             last_command_at = now;
         }
 
@@ -351,10 +359,16 @@ int main(int argc, char *argv[]) {
     state.transition.active = true;
     state.transition.key = -1;
     state.pending_policy.clear();
+    state.fault_ack_sequence = 0;
     ZeroVelocity(&state);
-    SendCommand(transport.get(), state);
-    runtime_logging::Log(runtime_logging::Level::kInfo,
-        "ROS HMI stopped after requesting POWER_OFF", false);
+    (void)SendCommand(transport.get(), &state);
+    runtime_logging::Log(
+        state.command_send_failed ? runtime_logging::Level::kWarning
+            : runtime_logging::Level::kInfo,
+        state.command_send_failed
+            ? "ROS HMI stopped; POWER_OFF request send failed, control timeout is fallback"
+            : "ROS HMI stopped after requesting POWER_OFF",
+        false);
     rclcpp::shutdown();
     return 0;
 }
