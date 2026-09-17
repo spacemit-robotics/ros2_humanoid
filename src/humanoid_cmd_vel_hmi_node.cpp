@@ -74,6 +74,12 @@ int main(int argc, char *argv[]) {
         node->declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel");
     const double cmd_vel_timeout_s = std::max(0.1,
         node->declare_parameter<double>("cmd_vel_timeout_s", 0.5));
+    const double cmd_vel_bias_x =
+        node->declare_parameter<double>("cmd_vel_bias_x", 0.0);
+    const double cmd_vel_bias_y =
+        node->declare_parameter<double>("cmd_vel_bias_y", 0.0);
+    const double cmd_vel_bias_yaw =
+        node->declare_parameter<double>("cmd_vel_bias_yaw", 0.0);
 
     runtime_logging::Log(runtime_logging::Level::kInfo,
         "ROS cmd_vel HMI started: topic=" + cmd_vel_topic, false);
@@ -101,12 +107,20 @@ int main(int argc, char *argv[]) {
                     ? "已收到 ROS cmd_vel，但 Control 状态未连接"
                     : "已收到 ROS cmd_vel，但当前状态/策略不接受速度";
             } else {
+                const bool has_velocity = msg->linear.x != 0.0 ||
+                    msg->linear.y != 0.0 || msg->angular.z != 0.0;
                 state.target_command.vx = std::clamp(
-                    static_cast<float>(msg->linear.x), -limits->max_vx, limits->max_vx);
+                    static_cast<float>(msg->linear.x +
+                        (has_velocity ? cmd_vel_bias_x : 0.0)),
+                    -limits->max_vx, limits->max_vx);
                 state.target_command.vy = std::clamp(
-                    static_cast<float>(msg->linear.y), -limits->max_vy, limits->max_vy);
+                    static_cast<float>(msg->linear.y +
+                        (has_velocity ? cmd_vel_bias_y : 0.0)),
+                    -limits->max_vy, limits->max_vy);
                 state.target_command.wz = std::clamp(
-                    static_cast<float>(msg->angular.z), -limits->max_wz, limits->max_wz);
+                    static_cast<float>(msg->angular.z +
+                        (has_velocity ? cmd_vel_bias_yaw : 0.0)),
+                    -limits->max_wz, limits->max_wz);
                 state.last_action = "ROS cmd_vel 已更新速度目标";
             }
             have_ros_command = true;

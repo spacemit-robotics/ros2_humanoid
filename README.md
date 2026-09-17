@@ -105,8 +105,14 @@ ros2 run humanoid humanoid_cmd_vel_hmi_node \
   "$PWD/application/native/humanoid_linglong/config/linglong.yaml" \
   --ros-args \
   -p cmd_vel_topic:=/cmd_vel \
-  -p cmd_vel_timeout_s:=0.5
+  -p cmd_vel_timeout_s:=0.5 \
+  -p cmd_vel_bias_x:=0.0 \
+  -p cmd_vel_bias_y:=0.0 \
+  -p cmd_vel_bias_yaw:=0.0
 ```
+
+三个速度偏置参数默认均为 `0.0`。收到的 x、y、yaw 只要有一个非零，
+就分别给三个分量加上对应偏置，再按当前策略的速度范围限幅；三个分量全为零时不加偏置。
 
 不要同时启动该节点和 `run_hmi_linglong.sh`，因为二者都是 HMI transport 端。
 
