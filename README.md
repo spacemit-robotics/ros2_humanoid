@@ -90,14 +90,14 @@ Nav2 /cmd_vel
 原 HMI transport 发送给 `control_runtime`。
 
 界面按键与当前原生 HMI 一致，包括故障确认 `X`、手动参考开始 `G`、交互动作
-选择 `A` 和取消 `C`。对包含 `stand_mjlab` 和 `walk_mjlab` 的配置，非零速度
-请求选择 `walk_mjlab`；零速度按驻留参数到期后选择站立策略。由于底层只允许在 `POWER_OFF`
+选择 `A` 和取消 `C`。通过 ZMQ `walk`、`stand`／`stop` 显式选择行走或站立策略；
+ROS `/cmd_vel` 和 ZMQ 速度命令仅在 `walk_mjlab` 已进入 `RL` 后生效。
+零速度及速度命令超时只清零速度，保持当前行走策略。由于底层只允许在 `POWER_OFF`
 或 `DAMP` 切换策略，节点会先清零速度，等待 `DAMP`，切换模型并等待 Control
 回传，然后按 `HOME → ZERO → RL` 恢复。任何故障、状态断线或请求超时都会
 中止自动恢复；切换期间可按 `F` 请求 `POWER_OFF`。单次 ZMQ 速度命令默认
 有效 10 秒，ROS `/cmd_vel` 默认超时 0.5 秒，超时后立即清零速度。
-`zero_velocity_walk_hold_s` 可让零速度在 `walk_mjlab` 下驻留一段时间，
-到期后再请求站立策略；默认 `0` 秒，保持原有切换时机。
+切换期间的速度命令不会缓存；策略就绪后需要发送新的速度命令。
 
 启动 driver 和 control 后，在交互式终端中用该节点替代
 `run_hmi_linglong.sh`：
@@ -116,36 +116,33 @@ ros2 run humanoid humanoid_cmd_vel_hmi_node \
   --ros-args \
   -p cmd_vel_topic:=/cmd_vel \
   -p cmd_vel_timeout_s:=0.5 \
-  -p zero_velocity_walk_hold_s:=10.0 \
   -p cmd_vel_bias_x:=0.0 \
-  -p cmd_vel_bias_y:=0.0 \
+  -p cmd_vel_bias_y:=0.2 \
   -p cmd_vel_bias_yaw:=0.0 \
   -p zmq_endpoint:=tcp://127.0.0.1:5565
 ```
 
 三个速度偏置参数默认均为 `0.0`。收到的 x、y、yaw 只要有一个非零，
 就分别给三个分量加上对应偏置，再按当前策略的速度范围限幅；三个分量全为零时不加偏置。
-`zero_velocity_walk_hold_s` 必须为非负有限数。行走策略正在 RL 运行时，
-首次收到全零速度或速度命令超时，会立即下发零速度并从此刻开始计时；
-重复的零速度消息不会重新计时。驻留期间收到非零速度会取消计时，继续行走；
-显式 ZMQ `stand`／`stop` 和 `wave`／`interaction` 请求会立即请求站立，
-不等待驻留时间。
+行走策略正在 RL 运行时，收到全零速度或速度命令超时会下发零速度，
+不会请求站立策略。需要站立时发送 ZMQ `stand` 或 `stop`。
 
 ### ZMQ 命令入口
 
 节点在 `zmq_endpoint` 上提供 JSON 请求／应答接口，默认仅监听本机。客户端
 使用 ZeroMQ `REQ` 连接，节点使用 `REP` 应答。应答中的 `ok` 表示请求已接收，
 `status` 可查询 Control 回传的实际状态；策略切换和交互动作可能仍在执行中。
-ZMQ 速度或站立请求在其有效期内优先于 ROS `/cmd_vel`，到期后恢复接收 ROS 速度。
+ZMQ 速度请求在 `duration_s` 指定的时间内优先于 ROS `/cmd_vel`，到期后恢复接收 ROS 速度。
 
 | 请求 | 效果 |
 | --- | --- |
 | `{"op":"status"}` | 查询在线状态、FSM、当前及目标策略、故障、交互阶段 |
+| `{"op":"walk"}` | 清零速度并请求行走策略；等待状态变为 `RL`、`walk_mjlab` 后再发送速度 |
 | `{"op":"stand"}` 或 `{"op":"stop"}` | 清零速度并请求站立策略 |
-| `{"op":"forward","vx":0.2}` | 请求前进并切换行走策略 |
-| `{"op":"velocity","vx":0.2,"vy":0,"wz":0,"duration_s":10}` | 请求速度；`duration_s` 范围 0.1～30 秒 |
-| `{"op":"wave"}` | 站立后播放 `wave_hello` 交互动作 |
-| `{"op":"interaction","action":"heart_both"}` | 播放站立策略注册的交互动作 |
+| `{"op":"forward","vx":0.2}` | 在就绪的行走策略下请求前进 |
+| `{"op":"velocity","vx":0.2,"vy":0,"wz":0,"duration_s":10}` | 在就绪的行走策略下请求速度；`duration_s` 范围 0.1～30 秒 |
+| `{"op":"wave"}` | 在就绪的站立策略下请求 `wave_hello` 交互动作 |
+| `{"op":"interaction","action":"heart_both"}` | 在就绪的站立策略下请求已注册交互动作 |
 | `{"op":"cancel"}` | 取消当前交互动作 |
 
 示例（需安装 `python3-zmq`）：
@@ -156,6 +153,9 @@ import zmq
 
 socket = zmq.Context.instance().socket(zmq.REQ)
 socket.connect("tcp://127.0.0.1:5565")
+socket.send_json({"op": "walk"})
+print(socket.recv_json())
+# 查询 status，待 mode=RL、policy=walk_mjlab 且 switching=false 后：
 socket.send_json({"op": "forward", "vx": 0.2, "duration_s": 10})
 print(socket.recv_json())
 ```
