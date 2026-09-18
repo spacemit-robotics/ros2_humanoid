@@ -10,6 +10,9 @@ find_package(geometry_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_path(ZMQ_INCLUDE_DIR zmq.h REQUIRED)
+find_library(ZMQ_LIBRARY zmq REQUIRED)
+find_path(NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp REQUIRED)
 
 find_path(HUMANOID_COMMON_INCLUDE_DIR
   NAMES robot_base.h transport_executor.h
@@ -60,12 +63,22 @@ set_target_properties(humanoid_nav_rl_bridge_node PROPERTIES
 # geometry_msgs/Twist as an additional velocity input. The native source is
 # included read-only so this target stays behaviorally aligned with hmi_runtime.
 set(HUMANOID_HMI_RUNTIME_SOURCE
-  "${CMAKE_CURRENT_SOURCE_DIR}/../../../../application/native/humanoid_common/src/runtime/hmi_runtime.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../../application/native/humanoid_common/src/runtime/hmi/hmi_runtime.cpp"
 )
-add_executable(humanoid_cmd_vel_hmi_node src/humanoid_cmd_vel_hmi_node.cpp)
+set(HUMANOID_HMI_SOURCE_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../../application/native/humanoid_common/src/runtime"
+)
+add_executable(humanoid_cmd_vel_hmi_node
+  src/humanoid_cmd_vel_hmi_node.cpp
+  "${HUMANOID_HMI_SOURCE_DIR}/hmi/interaction.cpp"
+)
 target_include_directories(humanoid_cmd_vel_hmi_node PRIVATE
   ${HUMANOID_COMMON_INCLUDE_DIR}
   "${CMAKE_CURRENT_SOURCE_DIR}/../../../../application/native/humanoid_common/src/logging"
+  "${HUMANOID_HMI_SOURCE_DIR}/common"
+  "${HUMANOID_HMI_SOURCE_DIR}/hmi"
+  ${ZMQ_INCLUDE_DIR}
+  ${NLOHMANN_JSON_INCLUDE_DIR}
 )
 target_compile_definitions(humanoid_cmd_vel_hmi_node PRIVATE
   HUMANOID_HMI_RUNTIME_SOURCE="${HUMANOID_HMI_RUNTIME_SOURCE}"
@@ -83,6 +96,7 @@ ament_target_dependencies(humanoid_cmd_vel_hmi_node
 target_link_libraries(humanoid_cmd_vel_hmi_node
   ${TRANSPORT_EXECUTOR_LIB}
   ${ROBOT_BASE_LIB}
+  ${ZMQ_LIBRARY}
   pthread
 )
 set_target_properties(humanoid_cmd_vel_hmi_node PROPERTIES
