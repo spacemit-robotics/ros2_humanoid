@@ -134,6 +134,9 @@ install(TARGETS humanoid_nav_rl_bridge_node humanoid_cmd_vel_hmi_node
   humanoid_head_tf_node
   DESTINATION lib/${PROJECT_NAME}
 )
+install(PROGRAMS scripts/asr_action_control.py
+  DESTINATION lib/${PROJECT_NAME}
+)
 
 install(DIRECTORY config launch
   DESTINATION share/${PROJECT_NAME}

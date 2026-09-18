@@ -160,6 +160,9 @@ socket.send_json({"op": "forward", "vx": 0.2, "duration_s": 10})
 print(socket.recv_json())
 ```
 
+站立策略的语音动作控制脚本见 [`scripts/asr_action_control.py`](scripts/asr_action_control.py)，
+录音依赖、启动方法和文本试运行方式见 [`scripts/README.md`](scripts/README.md)。
+
 不要同时启动该节点和 `run_hmi_linglong.sh`，因为二者都是 HMI transport 端。
 
 ## LingLong 头部与相机 TF
