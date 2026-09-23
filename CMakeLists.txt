@@ -7,8 +7,10 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_path(ZMQ_INCLUDE_DIR zmq.h REQUIRED)
 find_library(ZMQ_LIBRARY zmq REQUIRED)
@@ -130,8 +132,16 @@ set_target_properties(humanoid_head_tf_node PROPERTIES
   INSTALL_RPATH "${HUMANOID_COMMON_LIB_DIR}"
 )
 
+add_executable(tf_to_odom_node src/tf_to_odom_node.cpp)
+ament_target_dependencies(tf_to_odom_node
+  nav_msgs
+  rclcpp
+  tf2
+  tf2_ros
+)
+
 install(TARGETS humanoid_nav_rl_bridge_node humanoid_cmd_vel_hmi_node
-  humanoid_head_tf_node
+  humanoid_head_tf_node tf_to_odom_node
   DESTINATION lib/${PROJECT_NAME}
 )
 install(PROGRAMS scripts/asr_action_control.py
