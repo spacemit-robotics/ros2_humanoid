@@ -45,6 +45,68 @@ python scripts/asr_action_control.py -d 0 -r 48000 \
   --zmq-endpoint tcp://127.0.0.1:5565
 ```
 
+默认 ASR 后端是进程内运行的 SenseVoice。可以使用 `--asr-backend`
+切换到针对 K3 优化的 Qwen3-ASR 0.6B：
+
+```bash
+sudo apt update
+sudo apt install -y llama.cpp-tools-spacemit
+dpkg-query -W llama.cpp-tools-spacemit
+
+mkdir -p ~/.cache/models/asr/qwen3asr
+cd ~/.cache/models/asr/qwen3asr
+wget -O qwen3-asr-0.6B-dynq-q40.tar.gz \
+  https://archive.spacemit.com/spacemit-ai/model_zoo/asr/qwen3-asr-0.6B-dynq-q40.tar.gz
+tar -xzf qwen3-asr-0.6B-dynq-q40.tar.gz
+rm -f qwen3-asr-0.6B-dynq-q40.tar.gz
+```
+
+Qwen3-ASR 媒体后端要求 `llama.cpp-tools-spacemit` 版本不低于 `0.1.7`。
+模型目录默认是
+`~/.cache/models/asr/qwen3asr/qwen3-asr-0.6B-dynq-q40`，其中必须包含：
+
+```text
+Qwen3-ASR-0.6B-text-q40.gguf
+Qwen3-ASR-0.6B-encoder-backend.dynq.onnx
+Qwen3-ASR-0.6B-encoder-frontend.dynq.onnx
+```
+
+使用本机 Qwen3-ASR：
+
+```bash
+python scripts/asr_action_control.py \
+  --asr-backend qwen3_asr \
+  -d 0 -r 48000 -c 2 \
+  --zmq-endpoint tcp://127.0.0.1:5565
+```
+
+脚本默认检查 `http://127.0.0.1:8063/health`。端点尚未运行时，它会使用
+本机模型自动启动 `llama-server`，退出时只停止由本次脚本启动的服务。服务日志写入
+`/tmp/humanoid_qwen3_asr.log`。可用以下参数覆盖默认配置：
+
+- `--qwen3-model-dir`：本机模型目录。
+- `--qwen3-endpoint`：OpenAI 兼容的 `/v1/chat/completions` 地址。
+- `--qwen3-server-threads`：自动启动服务时的推理线程数，默认 `4`。
+- `--qwen3-timeout-sec`：单次识别请求超时，默认 `10` 秒。
+- `--qwen3-startup-timeout-sec`：等待本机服务启动的超时，默认 `90` 秒。
+- `--qwen3-no-auto-start`：不自动启动服务，用于连接已运行的本机或远程服务。
+
+使用另一台设备上的 Qwen3-ASR 服务：
+
+```bash
+python scripts/asr_action_control.py \
+  --asr-backend qwen3_asr \
+  --qwen3-endpoint http://192.168.1.20:8063/v1/chat/completions \
+  --qwen3-no-auto-start \
+  -d 0 -r 48000 -c 2 \
+  --zmq-endpoint tcp://127.0.0.1:5565
+```
+
+Qwen3-ASR 接收经过 VAD 分段的 16 kHz 单声道 WAV，每个语音段完成后输出整句
+文字，不是逐字流式识别。脚本会把全部动作短语和可选唤醒词作为识别上下文。
+多通道录音默认取各通道平均值；麦克风阵列若存在相位抵消，应优先把 `-c` 设置成
+设备实际可用的单通道模式。
+
 可用 `--wake-word 机器人` 要求每条指令包含唤醒词，例如“机器人挥手”。
 `--match-threshold` 默认 `0.72`；匹配有歧义时不会发动作。
 `--cooldown-s` 默认 `3` 秒，避免短时间重复触发。ZMQ 请求超时默认

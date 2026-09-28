@@ -156,7 +156,7 @@ def request_action(client, action):
 
 
 def run_audio(args, on_text):
-    """Capture audio and run VAD/ASR as in asr_simple.py."""
+    """Capture audio and run the selected buffered ASR backend."""
     import numpy as np
     import spacemit_audio
     from spacemit_audio import AudioCapture
@@ -174,14 +174,38 @@ def run_audio(args, on_text):
                   .with_min_speech_duration(100)
                   .with_smoothing(False))
     vad = spacemit_vad.VadEngine(vad_config)
-    asr_config = spacemit_asr.Config()
-    asr_config.provider = "cpu"
-    asr_config._config.num_threads = 4
-    asr_config.language = spacemit_asr.Language.ZH
-    asr_config.punctuation = True
-    asr = spacemit_asr.Engine(asr_config).initialize()
+    if args.asr_backend == "qwen3_asr":
+        from asr_backend import Qwen3AsrEngine
+
+        context_terms = list(dict.fromkeys(
+            phrase
+            for phrases in ACTION_PHRASES.values()
+            for phrase in phrases
+        ))
+        if args.wake_word:
+            context_terms.insert(0, args.wake_word)
+        asr = Qwen3AsrEngine({
+            "endpoint": args.qwen3_endpoint,
+            "model": args.qwen3_model,
+            "timeout_sec": args.qwen3_timeout_sec,
+            "context": " ".join(context_terms),
+            "max_transcript_chars": args.qwen3_max_transcript_chars,
+            "auto_start": not args.qwen3_no_auto_start,
+            "model_dir": args.qwen3_model_dir,
+            "server_threads": args.qwen3_server_threads,
+            "startup_timeout_sec": args.qwen3_startup_timeout_sec,
+            "server_log_path": "/tmp/humanoid_qwen3_asr.log",
+        }).initialize()
+    else:
+        asr_config = spacemit_asr.Config()
+        asr_config.provider = "cpu"
+        asr_config._config.num_threads = args.asr_threads
+        asr_config.language = spacemit_asr.Language.ZH
+        asr_config.punctuation = True
+        asr = spacemit_asr.Engine(asr_config).initialize()
     print(f"VAD: {vad.engine_name}; ASR: {asr.backend_name}")
-    asr.recognize(np.zeros(16000, dtype=np.float32))
+    if args.asr_backend == "sensevoice":
+        asr.recognize(np.zeros(16000, dtype=np.float32))
 
     target_rate = 16000
     resampler = (spacemit_asr.Resampler(args.rate, target_rate, channels=1)
@@ -276,6 +300,23 @@ def main():
     parser.add_argument("-r", "--rate", type=int, default=16000)
     parser.add_argument("-c", "--channels", type=int, default=2)
     parser.add_argument("-l", "--list-devices", action="store_true")
+    parser.add_argument("--asr-backend",
+                        choices=("sensevoice", "qwen3_asr"),
+                        default="sensevoice")
+    parser.add_argument("--asr-threads", type=int, default=4)
+    parser.add_argument(
+        "--qwen3-endpoint",
+        default="http://127.0.0.1:8063/v1/chat/completions")
+    parser.add_argument("--qwen3-model", default="qwen3-asr")
+    parser.add_argument("--qwen3-timeout-sec", type=float, default=10.0)
+    parser.add_argument(
+        "--qwen3-model-dir",
+        default="~/.cache/models/asr/qwen3asr/qwen3-asr-0.6B-dynq-q40")
+    parser.add_argument("--qwen3-server-threads", type=int, default=4)
+    parser.add_argument("--qwen3-startup-timeout-sec", type=float,
+                        default=90.0)
+    parser.add_argument("--qwen3-max-transcript-chars", type=int, default=32)
+    parser.add_argument("--qwen3-no-auto-start", action="store_true")
     parser.add_argument("--zmq-endpoint", default="tcp://127.0.0.1:5565")
     parser.add_argument("--zmq-timeout-ms", type=int, default=1000)
     parser.add_argument("--match-threshold", type=float, default=0.72)
@@ -290,6 +331,12 @@ def main():
     if (not math.isfinite(args.cooldown_s) or args.cooldown_s < 0 or
             args.zmq_timeout_ms <= 0):
         parser.error("cooldown and ZMQ timeout must be nonnegative/positive")
+    if (args.asr_threads <= 0 or args.qwen3_timeout_sec <= 0 or
+            args.qwen3_server_threads <= 0 or
+            args.qwen3_startup_timeout_sec <= 0 or
+            args.qwen3_max_transcript_chars <= 0):
+        parser.error(
+            "ASR thread counts, timeouts and text limit must be positive")
     if args.text is not None and args.list_devices:
         parser.error("--text and --list-devices cannot be combined")
 

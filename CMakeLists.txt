@@ -147,6 +147,9 @@ install(TARGETS humanoid_nav_rl_bridge_node humanoid_cmd_vel_hmi_node
 install(PROGRAMS scripts/asr_action_control.py
   DESTINATION lib/${PROJECT_NAME}
 )
+install(FILES scripts/asr_backend.py
+  DESTINATION lib/${PROJECT_NAME}
+)
 
 install(DIRECTORY config launch
   DESTINATION share/${PROJECT_NAME}
