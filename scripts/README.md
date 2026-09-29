@@ -74,10 +74,23 @@ Qwen3-ASR-0.6B-encoder-frontend.dynq.onnx
 使用本机 Qwen3-ASR：
 
 ```bash
-python scripts/asr_action_control.py \
+python asr_action_control.py \
   --asr-backend qwen3_asr \
-  -d 0 -r 48000 -c 2 \
-  --zmq-endpoint tcp://127.0.0.1:5565
+  -d 0 -r 48000 -c 1 \
+  --playback-device 1 \
+  --wake-word 小龙
+```
+
+使用, 在没有 zmq 服务时进行语音链路验证：
+
+```bash
+--dry-run
+```
+
+如需显式指定播放格式：
+
+```bash
+--playback-rate 48000 --playback-channels 2
 ```
 
 脚本默认检查 `http://127.0.0.1:8063/health`。端点尚未运行时，它会使用
@@ -112,6 +125,17 @@ Qwen3-ASR 接收经过 VAD 分段的 16 kHz 单声道 WAV，每个语音段完�
 `--cooldown-s` 默认 `3` 秒，避免短时间重复触发。ZMQ 请求超时默认
 `1000` 毫秒，可用 `--zmq-timeout-ms` 调整。返回“queued”只表示 HMI
 接受排队请求，动作实际执行情况以 Control 状态回传为准。
+VAD 分段默认最长 `8` 秒；持续噪声导致检测不到语音结束时，会强制
+结束当前分段，可用 `--max-utterance-s` 调整。
+
+动作请求排队成功后会播放“正在执行”；包含唤醒词但无法唯一匹配
+动作时会播放“没听清楚”。未配置唤醒词时，任何非空 ASR 结果匹配失败
+都会播放“没听清楚”。播报时会暂停录音，避免提示音被 ASR 再次识别。
+提示音会转换为默认的 48 kHz 双声道后播放，可用 `--playback-device`
+选择输出设备，用 `--playback-rate` 和 `--playback-channels` 适配其他声卡，
+用 `--no-audio-prompts` 关闭播报。
+`--dry-run` 不发送 ZMQ 动作，但匹配成功时仍会播放“正在执行”；
+匹配失败时不播放“没听清楚”。
 
 脚本也安装为 ROS 2 可执行程序，可在构建并加载工作区后用
 `ros2 run humanoid asr_action_control.py` 启动。

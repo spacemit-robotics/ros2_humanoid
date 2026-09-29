@@ -9,6 +9,7 @@ import argparse
 import collections
 from difflib import SequenceMatcher
 import math
+from pathlib import Path
 import queue
 import re
 import signal
@@ -43,6 +44,10 @@ PREFIXES = ("小机器人", "机器人", "请你", "请", "帮我", "给我", "�
             "来个", "做一个", "做个", "表演一个", "表演")
 SUFFIXES = ("动作", "一下", "好吗", "好不好", "可以吗", "吧", "呀", "啊")
 BUSY_PHASES = {"进入", "播放", "保持", "收回"}
+PROMPT_FILES = {
+    "executing": "zhengzaizhixing.wav",
+    "unclear": "meitingqinchu.wav",
+}
 
 
 def clean_text(text):
@@ -108,6 +113,90 @@ def match_action(text, threshold=0.72, wake_word=""):
     return None
 
 
+def has_wake_word(text, wake_word):
+    """Return whether normalized text contains a usable configured wake word."""
+    wake = clean_text(wake_word)
+    return bool(wake and wake in clean_text(text))
+
+
+def prompt_path(prompt):
+    """Find a prompt in either the source tree or the installed layout."""
+    filename = PROMPT_FILES[prompt]
+    script_dir = Path(__file__).resolve().parent
+    candidates = (
+        script_dir / "assets" / filename,
+        script_dir.parent / "assets" / filename,
+    )
+    return next((path for path in candidates if path.is_file()), candidates[0])
+
+
+def load_prompt_pcm(path, output_rate, output_channels):
+    """Load PCM16 WAV and adapt it to the playback device format."""
+    import wave
+
+    import numpy as np
+
+    with wave.open(str(path), "rb") as wav:
+        if wav.getcomptype() != "NONE" or wav.getsampwidth() != 2:
+            raise RuntimeError("only uncompressed 16-bit WAV is supported")
+        input_rate = wav.getframerate()
+        input_channels = wav.getnchannels()
+        samples = np.frombuffer(
+            wav.readframes(wav.getnframes()), dtype="<i2")
+
+    if input_rate <= 0 or input_channels <= 0 or len(samples) == 0:
+        raise RuntimeError("WAV has invalid or empty audio data")
+    samples = samples.reshape(-1, input_channels).astype(np.float32)
+
+    if input_channels != output_channels:
+        if output_channels == 1:
+            samples = samples.mean(axis=1, keepdims=True)
+        elif input_channels == 1:
+            samples = np.repeat(samples, output_channels, axis=1)
+        elif output_channels < input_channels:
+            samples = samples[:, :output_channels]
+        else:
+            samples = np.pad(
+                samples, ((0, 0), (0, output_channels - input_channels)),
+                mode="edge")
+
+    if input_rate != output_rate:
+        input_frames = len(samples)
+        output_frames = max(1, round(input_frames * output_rate / input_rate))
+        source_positions = np.arange(output_frames) * input_rate / output_rate
+        source_positions = np.minimum(source_positions, input_frames - 1)
+        source_frames = np.arange(input_frames)
+        samples = np.stack([
+            np.interp(source_positions, source_frames, samples[:, channel])
+            for channel in range(output_channels)
+        ], axis=1)
+
+    pcm = np.rint(np.clip(samples, -32768, 32767)).astype("<i2")
+    return pcm.tobytes()
+
+
+def play_prompt(prompt, device=-1, rate=48000, channels=2):
+    """Convert and play one WAV prompt; failure must not stop control."""
+    path = prompt_path(prompt)
+    try:
+        from spacemit_audio import AudioPlayer
+
+        pcm = load_prompt_pcm(path, rate, channels)
+        with AudioPlayer(device) as player:
+            if not player.start(sample_rate=rate, channels=channels):
+                raise RuntimeError(
+                    f"cannot open playback at {rate} Hz/{channels} channels")
+            chunk_bytes = 4096 * channels * 2
+            for offset in range(0, len(pcm), chunk_bytes):
+                if not player.write(pcm[offset:offset + chunk_bytes]):
+                    raise RuntimeError("AudioPlayer.write returned false")
+            player.stop()
+        return True
+    except Exception as error:
+        print(f"[ERROR] cannot play prompt {path}: {error}", flush=True)
+        return False
+
+
 class HmiClient:
     """Use a fresh REQ socket for each request so timeouts cannot wedge it."""
 
@@ -159,12 +248,16 @@ def run_audio(args, on_text):
     """Capture audio and run the selected buffered ASR backend."""
     import numpy as np
     import spacemit_audio
-    from spacemit_audio import AudioCapture
+    from spacemit_audio import AudioCapture, AudioPlayer
     import spacemit_asr
     import spacemit_vad
 
     if args.list_devices:
+        print("Capture devices:")
         for index, name in AudioCapture.list_devices():
+            print(f"  [{index}] {name}")
+        print("Playback devices:")
+        for index, name in AudioPlayer.list_devices():
             print(f"  [{index}] {name}")
         return
 
@@ -211,10 +304,11 @@ def run_audio(args, on_text):
     resampler = (spacemit_asr.Resampler(args.rate, target_rate, channels=1)
                  if args.rate != target_rate else None)
     audio_queue = queue.Queue()
-    state = {"in_speech": False}
+    state = {"in_speech": False, "samples": 0}
     speech_buffer = []
     pre_buffer = collections.deque()
     pre_buf_max = target_rate * 800 // 1000
+    max_utterance_samples = round(args.max_utterance_s * target_rate)
     pre_buf_size = [0]
     running = threading.Event()
     running.set()
@@ -232,20 +326,37 @@ def run_audio(args, on_text):
             result = vad.detect(samples, target_rate)
             if result is None:
                 return
-            if result.is_speech_start:
+            if state["in_speech"]:
+                # Some VAD backends can emit another start event before the
+                # current utterance ends. Keep appending instead of discarding
+                # the active buffer and starting over.
+                speech_buffer.append(samples.copy())
+                state["samples"] += len(samples)
+                forced_end = state["samples"] >= max_utterance_samples
+                if result.is_speech_end or forced_end:
+                    audio = np.concatenate(speech_buffer)
+                    audio_queue.put(audio)
+                    speech_buffer.clear()
+                    state["in_speech"] = False
+                    state["samples"] = 0
+                    vad.reset()
+                    reason = "maximum duration" if forced_end else "silence"
+                    print(
+                        f"[VAD] speech ended ({len(audio) / target_rate:.1f}s, "
+                        f"{reason})",
+                        flush=True,
+                    )
+            elif result.is_speech_start:
                 state["in_speech"] = True
                 speech_buffer.clear()
+                state["samples"] = 0
                 if pre_buffer:
-                    speech_buffer.append(np.concatenate(list(pre_buffer)))
+                    prefix = np.concatenate(list(pre_buffer))
+                    speech_buffer.append(prefix)
+                    state["samples"] += len(prefix)
                 speech_buffer.append(samples.copy())
+                state["samples"] += len(samples)
                 print("[VAD] speech detected", flush=True)
-            elif state["in_speech"] and not result.is_speech_end:
-                speech_buffer.append(samples.copy())
-            elif result.is_speech_end and state["in_speech"]:
-                speech_buffer.append(samples.copy())
-                audio_queue.put(np.concatenate(speech_buffer))
-                speech_buffer.clear()
-                state["in_speech"] = False
 
             if not state["in_speech"]:
                 pre_buffer.append(samples.copy())
@@ -260,10 +371,12 @@ def run_audio(args, on_text):
         channels=args.channels,
         chunk_size=args.rate * args.channels * 2 // 25,
         capture_device=args.device,
+        player_device=args.playback_device,
     )
     capture = AudioCapture()
     capture.set_callback(on_audio)
-    capture.start()
+    if not capture.start():
+        raise RuntimeError(f"cannot start capture device {args.device}")
     print(f"Listening on device {args.device}; Ctrl+C to exit")
 
     def stop_handler(_signal, _frame):
@@ -272,6 +385,37 @@ def run_audio(args, on_text):
 
     previous_int = signal.signal(signal.SIGINT, stop_handler)
     previous_term = signal.signal(signal.SIGTERM, stop_handler)
+
+    def reset_detection_state():
+        state["in_speech"] = False
+        state["samples"] = 0
+        speech_buffer.clear()
+        pre_buffer.clear()
+        pre_buf_size[0] = 0
+        vad.reset()
+
+        while True:
+            try:
+                pending = audio_queue.get_nowait()
+            except queue.Empty:
+                break
+            if pending is None:
+                running.clear()
+
+    def play_prompt_without_echo(prompt):
+        # Do not let the microphone feed the speaker prompt back into ASR.
+        capture.close()
+        reset_detection_state()
+        try:
+            play_prompt(prompt, args.playback_device,
+                        args.playback_rate, args.playback_channels)
+        finally:
+            reset_detection_state()
+            if running.is_set() and not capture.start():
+                running.clear()
+                raise RuntimeError(
+                    f"cannot restart capture device {args.device}")
+
     try:
         while running.is_set():
             try:
@@ -284,7 +428,9 @@ def run_audio(args, on_text):
                 result = asr.recognize(audio)
                 if result and not result.is_empty:
                     print(f"[ASR] {result.text} (RTF={result.rtf:.2f})")
-                    on_text(result.text)
+                    prompt = on_text(result.text)
+                    if prompt is not None:
+                        play_prompt_without_echo(prompt)
             except Exception as error:
                 print(f"[ERROR] recognition/control: {error}", flush=True)
     finally:
@@ -297,6 +443,9 @@ def run_audio(args, on_text):
 def main():
     parser = argparse.ArgumentParser(description="LingLong standing action voice control")
     parser.add_argument("-d", "--device", type=int, default=-1)
+    parser.add_argument("--playback-device", type=int, default=-1)
+    parser.add_argument("--playback-rate", type=int, default=48000)
+    parser.add_argument("--playback-channels", type=int, default=2)
     parser.add_argument("-r", "--rate", type=int, default=16000)
     parser.add_argument("-c", "--channels", type=int, default=2)
     parser.add_argument("-l", "--list-devices", action="store_true")
@@ -321,7 +470,10 @@ def main():
     parser.add_argument("--zmq-timeout-ms", type=int, default=1000)
     parser.add_argument("--match-threshold", type=float, default=0.72)
     parser.add_argument("--cooldown-s", type=float, default=3.0)
+    parser.add_argument("--max-utterance-s", type=float, default=8.0)
     parser.add_argument("--wake-word", default="")
+    parser.add_argument("--no-audio-prompts", action="store_true",
+                        help="disable action and recognition result prompts")
     parser.add_argument("--dry-run", action="store_true",
                         help="print matches without sending ZMQ commands")
     parser.add_argument("--text", help="match one sentence without a microphone")
@@ -329,14 +481,20 @@ def main():
     if not 0.0 < args.match_threshold <= 1.0:
         parser.error("--match-threshold must be in (0, 1]")
     if (not math.isfinite(args.cooldown_s) or args.cooldown_s < 0 or
+            not math.isfinite(args.max_utterance_s) or
+            args.max_utterance_s <= 0 or
             args.zmq_timeout_ms <= 0):
-        parser.error("cooldown and ZMQ timeout must be nonnegative/positive")
-    if (args.asr_threads <= 0 or args.qwen3_timeout_sec <= 0 or
+        parser.error(
+            "cooldown must be nonnegative; utterance and ZMQ timeouts "
+            "must be positive")
+    if (args.asr_threads <= 0 or args.playback_rate <= 0 or
+            args.playback_channels <= 0 or args.qwen3_timeout_sec <= 0 or
             args.qwen3_server_threads <= 0 or
             args.qwen3_startup_timeout_sec <= 0 or
             args.qwen3_max_transcript_chars <= 0):
         parser.error(
-            "ASR thread counts, timeouts and text limit must be positive")
+            "audio format, ASR thread counts, timeouts and text limit "
+            "must be positive")
     if args.text is not None and args.list_devices:
         parser.error("--text and --list-devices cannot be combined")
 
@@ -348,22 +506,32 @@ def main():
         matched = match_action(text, args.match_threshold, args.wake_word)
         if matched is None:
             print(f"[SKIP] no unambiguous action: {text}")
-            return
+            if (not args.no_audio_prompts and not args.dry_run and
+                    (not args.wake_word or
+                     has_wake_word(text, args.wake_word))):
+                return "unclear"
+            return None
         action, score = matched
         print(f"[MATCH] {text} -> {action} ({score:.2f})")
         if args.dry_run:
-            return
+            return None if args.no_audio_prompts else "executing"
         now = time.monotonic()
         if now - last_sent_at[0] < args.cooldown_s:
             print("[SKIP] action cooldown")
-            return
+            return None
         if request_action(client, action):
             last_sent_at[0] = now
+            if not args.no_audio_prompts:
+                return "executing"
+        return None
 
     try:
         if args.text is not None:
             try:
-                handle_text(args.text)
+                prompt = handle_text(args.text)
+                if prompt is not None:
+                    play_prompt(prompt, args.playback_device,
+                                args.playback_rate, args.playback_channels)
             except Exception as error:
                 parser.exit(1, f"[ERROR] {error}\n")
         else:

@@ -150,6 +150,9 @@ install(PROGRAMS scripts/asr_action_control.py
 install(FILES scripts/asr_backend.py
   DESTINATION lib/${PROJECT_NAME}
 )
+install(DIRECTORY assets
+  DESTINATION lib/${PROJECT_NAME}
+)
 
 install(DIRECTORY config launch
   DESTINATION share/${PROJECT_NAME}

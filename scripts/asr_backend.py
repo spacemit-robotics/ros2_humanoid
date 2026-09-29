@@ -465,7 +465,10 @@ class Qwen3AsrEngine:
                     ],
                 },
             ],
-            "max_tokens": 512,
+            # Command transcripts are short. A tight generation cap prevents
+            # occasional non-ASR continuations from running until HTTP timeout.
+            "max_tokens": max(
+                16, min(128, self.max_transcript_chars * 2)),
             "temperature": 0,
         }
         request = urllib.request.Request(
