@@ -312,8 +312,10 @@ def run_audio(args, on_text):
     pre_buf_size = [0]
     running = threading.Event()
     running.set()
+    playback_active = threading.Event()
+    audio_state_lock = threading.Lock()
 
-    def on_audio(data):
+    def process_audio(data):
         try:
             samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
             if args.channels > 1:
@@ -366,6 +368,13 @@ def run_audio(args, on_text):
         except Exception as error:
             print(f"[ERROR] audio callback: {error}", flush=True)
 
+    def on_audio(data):
+        if playback_active.is_set():
+            return
+        with audio_state_lock:
+            if not playback_active.is_set():
+                process_audio(data)
+
     spacemit_audio.init(
         sample_rate=args.rate,
         channels=args.channels,
@@ -403,18 +412,21 @@ def run_audio(args, on_text):
                 running.clear()
 
     def play_prompt_without_echo(prompt):
-        # Do not let the microphone feed the speaker prompt back into ASR.
-        capture.close()
-        reset_detection_state()
+        # Keep the USB capture stream open, but discard frames while the
+        # speaker is active so its prompt cannot feed back into ASR. Some ALSA
+        # devices report a successful restart without resuming callbacks.
+        playback_active.set()
+        with audio_state_lock:
+            reset_detection_state()
         try:
             play_prompt(prompt, args.playback_device,
                         args.playback_rate, args.playback_channels)
         finally:
-            reset_detection_state()
-            if running.is_set() and not capture.start():
-                running.clear()
-                raise RuntimeError(
-                    f"cannot restart capture device {args.device}")
+            # Discard a short acoustic tail before listening again.
+            time.sleep(0.2)
+            with audio_state_lock:
+                reset_detection_state()
+            playback_active.clear()
 
     try:
         while running.is_set():
