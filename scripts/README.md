@@ -27,6 +27,9 @@ python scripts/asr_simple.py -d 0 -r 48000
 
 ## 站立动作语音控制
 
+直接通过 ZMQ 查询状态、执行或取消交互动作的消息格式见
+[`ZMQ_ACTIONS.md`](ZMQ_ACTIONS.md)。
+
 先启动 `humanoid_cmd_vel_hmi_node`，并让机器人进入 `stand_mjlab` 策略的
 `RL` 状态。语音脚本只在 HMI 报告在线、无故障、站立策略已生效且没有切换或
 进行中的交互动作时发送请求，不会自动上电或切换到站立模型。
