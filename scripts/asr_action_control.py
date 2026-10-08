@@ -43,7 +43,12 @@ ACTION_PHRASES = {
 PREFIXES = ("小机器人", "机器人", "请你", "请", "帮我", "给我", "来一个",
             "来个", "做一个", "做个", "表演一个", "表演")
 SUFFIXES = ("动作", "一下", "好吗", "好不好", "可以吗", "吧", "呀", "啊")
-BUSY_PHASES = {"进入", "播放", "保持", "收回"}
+# Keep the legacy labels for compatibility with older HMI adapters.  The
+# operator service client exposes the protocol's English phase names.
+BUSY_PHASES = {
+    "进入", "播放", "保持", "收回",
+    "BLEND_IN", "PLAYING", "HOLDING", "BLEND_OUT",
+}
 PROMPT_FILES = {
     "executing": "zhengzaizhixing.wav",
     "unclear": "meitingqinchu.wav",
@@ -229,10 +234,13 @@ def request_action(client, action):
     status = client.request({"op": "status"})
     if not isinstance(status, dict) or not status.get("ok"):
         raise RuntimeError(f"HMI status request failed: {status}")
+    rl_ready = (status.get("mode") == "RL" and
+                status.get("policy") == "stand_mjlab")
+    trajectory_ready = (status.get("trajectory_enabled") and
+                        status.get("mode") == "TRAJECTORY")
     if (not status.get("online") or status.get("fault") or
-            status.get("mode") != "RL" or
-            status.get("policy") != "stand_mjlab" or status.get("switching")):
-        print("[SKIP] Control is not ready in stand_mjlab/RL")
+            not (rl_ready or trajectory_ready) or status.get("switching")):
+        print("[SKIP] Control is not ready in stand_mjlab/RL or TRAJECTORY")
         return False
     if status.get("interaction_phase") in BUSY_PHASES:
         print("[SKIP] an interaction is already playing")

@@ -18,8 +18,8 @@ ZMQ 消息格式。
 
 - Control 在线且 HMI 命令通道已连接；
 - 没有锁存故障；
-- FSM 当前处于 `RL`；
-- 当前策略为 `stand_mjlab`；
+- 全身配置的 FSM 当前处于 `RL`，策略为 `stand_mjlab`；或者
+- `linglong_static.yaml` 固定底座配置的 FSM 当前处于 `TRAJECTORY`；
 - 没有进行策略切换；
 - 没有其他交互动作处于“进入”“播放”“保持”或“收回”阶段。
 
@@ -37,15 +37,21 @@ ZMQ 消息格式。
   "online": true,
   "mode": "RL",
   "policy": "stand_mjlab",
+  "trajectory_enabled": false,
   "desired_policy": "stand_mjlab",
   "switching": false,
-  "interaction_phase": "就绪",
+  "interaction_phase": "IDLE",
   "fault": false
 }
 ```
 
-可以发送新动作的 `interaction_phase` 通常为“就绪”“完成”或“拒绝”。“进入”、
-“播放”、“保持”和“收回”表示已有动作正在执行。
+静态模式就绪时，`mode` 为 `TRAJECTORY`、`policy` 为空且
+`trajectory_enabled` 为 `true`。向节点发送 `{"op":"stand"}` 时，节点会按配置
+自动选择 `RL/stand_mjlab` 或 `TRAJECTORY`，调用方不需要区分。
+
+可以发送新动作的 `interaction_phase` 通常为 `IDLE`、`FINISHED` 或 `REJECTED`。
+`BLEND_IN`、`PLAYING`、`HOLDING` 和 `BLEND_OUT` 表示已有动作正在执行。
+ASR 脚本同时兼容旧 HMI 返回的中文阶段名称。
 
 ## 发送交互动作
 
@@ -169,7 +175,7 @@ ready = (
     and status.get("policy") == "stand_mjlab"
     and not status.get("switching")
     and status.get("interaction_phase")
-    not in {"进入", "播放", "保持", "收回"}
+    not in {"BLEND_IN", "PLAYING", "HOLDING", "BLEND_OUT"}
 )
 if not ready:
     raise RuntimeError(f"robot is not ready: {status}")
@@ -186,10 +192,9 @@ for _ in range(100):
     socket.send_json({"op": "status"})
     status = socket.recv_json()
     print(status["interaction_phase"])
-    if status["interaction_phase"] in {"完成", "拒绝"}:
+    if status["interaction_phase"] in {"FINISHED", "REJECTED"}:
         break
 ```
 
 生产代码应像 `asr_action_control.py` 一样在超时后丢弃当前 `REQ` socket 并新建
 socket，避免 ZMQ `REQ` 状态机因缺少响应而无法发送后续请求。
-

@@ -35,10 +35,17 @@ find_library(TRANSPORT_EXECUTOR_LIB transport_executor
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../output/staging"
   PATH_SUFFIXES lib
 )
+find_library(OPERATOR_CLIENT_LIB operator_client
+  HINTS
+    "$ENV{SDK_ROOT}/output/staging"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../output/staging"
+  PATH_SUFFIXES lib
+)
 
-if(NOT HUMANOID_COMMON_INCLUDE_DIR OR NOT ROBOT_BASE_LIB OR NOT TRANSPORT_EXECUTOR_LIB)
+if(NOT HUMANOID_COMMON_INCLUDE_DIR OR NOT ROBOT_BASE_LIB OR
+  NOT TRANSPORT_EXECUTOR_LIB OR NOT OPERATOR_CLIENT_LIB)
   message(FATAL_ERROR
-    "robot_base/transport_executor not found. Build/install application/native/humanoid_common first "
+    "humanoid_common libraries not found. Build/install application/native/humanoid_common first "
     "and add its install prefix to CMAKE_PREFIX_PATH.")
 endif()
 
@@ -52,7 +59,7 @@ ament_target_dependencies(humanoid_nav_rl_bridge_node
   std_msgs
 )
 target_link_libraries(humanoid_nav_rl_bridge_node
-  ${TRANSPORT_EXECUTOR_LIB}
+  ${OPERATOR_CLIENT_LIB}
   ${ROBOT_BASE_LIB}
   pthread
 )
@@ -61,42 +68,21 @@ set_target_properties(humanoid_nav_rl_bridge_node PROPERTIES
   INSTALL_RPATH "${HUMANOID_COMMON_LIB_DIR}"
 )
 
-# Interactive HMI that keeps the native terminal/FSM behavior and accepts
-# geometry_msgs/Twist as an additional velocity input. The native source is
-# included read-only so this target stays behaviorally aligned with hmi_runtime.
-set(HUMANOID_HMI_RUNTIME_SOURCE
-  "${CMAKE_CURRENT_SOURCE_DIR}/../../../../application/native/humanoid_common/src/runtime/hmi/hmi_runtime.cpp"
-)
-set(HUMANOID_HMI_SOURCE_DIR
-  "${CMAKE_CURRENT_SOURCE_DIR}/../../../../application/native/humanoid_common/src/runtime"
-)
+# ROS velocity and ZMQ compatibility client for the native operator service.
 add_executable(humanoid_cmd_vel_hmi_node
   src/humanoid_cmd_vel_hmi_node.cpp
-  "${HUMANOID_HMI_SOURCE_DIR}/hmi/interaction.cpp"
 )
 target_include_directories(humanoid_cmd_vel_hmi_node PRIVATE
   ${HUMANOID_COMMON_INCLUDE_DIR}
-  "${CMAKE_CURRENT_SOURCE_DIR}/../../../../application/native/humanoid_common/src/logging"
-  "${HUMANOID_HMI_SOURCE_DIR}/common"
-  "${HUMANOID_HMI_SOURCE_DIR}/hmi"
   ${ZMQ_INCLUDE_DIR}
   ${NLOHMANN_JSON_INCLUDE_DIR}
-)
-target_compile_definitions(humanoid_cmd_vel_hmi_node PRIVATE
-  HUMANOID_HMI_RUNTIME_SOURCE="${HUMANOID_HMI_RUNTIME_SOURCE}"
-)
-set_property(SOURCE src/humanoid_cmd_vel_hmi_node.cpp APPEND PROPERTY
-  OBJECT_DEPENDS
-    "${HUMANOID_HMI_RUNTIME_SOURCE}"
-    "${HUMANOID_COMMON_INCLUDE_DIR}/transport_executor.h"
-    "${TRANSPORT_EXECUTOR_LIB}"
 )
 ament_target_dependencies(humanoid_cmd_vel_hmi_node
   geometry_msgs
   rclcpp
 )
 target_link_libraries(humanoid_cmd_vel_hmi_node
-  ${TRANSPORT_EXECUTOR_LIB}
+  ${OPERATOR_CLIENT_LIB}
   ${ROBOT_BASE_LIB}
   ${ZMQ_LIBRARY}
   pthread

@@ -5,15 +5,17 @@
 `humanoid` 是人形机器人 ROS2 控制集成包，用于把 ROS2 导航、终端控制和 TF
 接入现有 native 人形机器人运控链路。当前提供三个节点：
 
-- `humanoid_nav_rl_bridge_node`：将 Nav2 `/cmd_vel` 速度指令接入 RL 运控链路，用于mujoco一键仿真。
-- `humanoid_cmd_vel_hmi_node`：保留原生 HMI 的界面与 FSM 操作，同时接收 ROS2
-  `/cmd_vel`，用于实机 ros2 控制机器人。
+- `humanoid_nav_rl_bridge_node`：通过 `hmi_runtime` 的 operator socket 服务将 Nav2
+  `/cmd_vel` 接入 RL 运控链路，用于 MuJoCo 仿真和实机导航。
+- `humanoid_cmd_vel_hmi_node`：通过同一 operator socket 服务接收 ROS2 `/cmd_vel`，
+  并保留已有 ZMQ 语音动作兼容入口。
 - `humanoid_head_tf_node`：只读获取 LingLong 头部 yaw、pitch 实机关节角度，发布
   虚拟 `base_link` 和头部动态 TF；配套 launch 通过 `tf2_ros` 发布相机静态 TF，
   无需 URDF，用于实机建图避障场景。
 
-节点复用现有 `transport_executor` 或只读观察其 SHM 状态，不修改
-`control_runtime`、`driver_runtime` 或策略实现。
+控制节点使用公开的 `operator_client` 接口，不再直接充当 transport HMI 写端；
+`humanoid_head_tf_node` 仍只读观察 SHM 状态。不修改 `control_runtime`、
+`driver_runtime` 或策略实现。
 
 ## 功能特性
 
@@ -31,7 +33,7 @@
 ### 环境准备
 
 准备 ROS2 Humble，并先构建 `application/native/humanoid_common`，确保
-`robot_base` 和 `transport_executor` 已安装到 `output/staging`。
+`robot_base`、`transport_executor` 和 `operator_client` 已安装到 `output/staging`。
 
 ### 构建编译
 
@@ -46,17 +48,28 @@ m -R
 
 ### 运行示例
 
-先启动匹配的 driver 和 `control_runtime`，再启动桥接节点：
+仿真时先用一键脚本启动 MuJoCo driver、`control_runtime` 和无界面
+`hmi_runtime`，再启动桥接节点。`--no-tui` 避免终端 TUI 与 ROS 节点竞争控制权：
 
 ```bash
 source /opt/ros/humble/setup.bash
+# 终端 1
 source output/staging/setup.bash
+run_linglong.sh --sim --no-tui
+```
 
+```bash
+# 终端 2
+source output/staging/setup.bash
 ros2 launch humanoid linglong_nav_rl_bridge.launch.py \
   robot_config_path:=$PWD/application/native/humanoid_linglong/config/linglong.yaml \
   auto_fsm:=true \
   auto_policy:=walk_mjlab
 ```
+
+若已分别启动 `run_driver_linglong.sh --sim` 和 `run_control_linglong.sh`，则只需再运行
+`run_hmi_linglong.sh --sim`。`run_hmi_linglong.sh` 本身仅启动 operator 服务，不负责
+创建 MuJoCo 窗口；窗口由 MuJoCo driver 创建。
 
 `auto_fsm:=true` 会自动请求执行
 `POWER_OFF -> DAMP -> HOME -> ZERO -> RL`。可通过以下命令检查状态：
@@ -72,6 +85,8 @@ ros2 topic echo /humanoid_nav_rl_bridge/status
 ```text
 Nav2 /cmd_vel
   -> humanoid_nav_rl_bridge
+  -> operator_client (WebSocket)
+  -> hmi_runtime / operator_service
   -> transport HMI command
   -> control_runtime / behavior_manager
   -> RL locomotion policy
@@ -82,25 +97,26 @@ Nav2 /cmd_vel
 参数默认值见 [`config/linglong_nav_rl_bridge.yaml`](config/linglong_nav_rl_bridge.yaml)。
 后续完整接口和部署方式以 SpacemiT Robot 官方文档为准。
 
-## ROS2 cmd_vel 终端 HMI
+## ROS2 cmd_vel operator 客户端
 
-`humanoid_cmd_vel_hmi_node` 是 `run_hmi_linglong.sh` 的 ROS2 输入版本。它复用
-原 HMI 的终端界面、FSM 状态切换、策略选择、状态确认、心跳和退出保护逻辑，
-并订阅 `/cmd_vel` 更新速度。节点不会通过 ROS2 发布机器人控制消息；控制仍由
-原 HMI transport 发送给 `control_runtime`。
+`humanoid_cmd_vel_hmi_node` 是 `hmi_runtime` 的无界面 ROS2 客户端。它订阅
+`/cmd_vel`，通过安装的 `liboperator_client.so` 申请并续租控制权，再由
+`operator_service` 完成状态校验、速度限幅和 transport 转发。终端操作界面已独立为
+`hmi_tui`；需要时可另开终端运行 `run_hmi_tui_linglong.sh`，但同一时刻只能有一个
+客户端持有控制权。
 
-界面按键与当前原生 HMI 一致，包括故障确认 `X`、手动参考开始 `G`、交互动作
-选择 `A` 和取消 `C`。通过 ZMQ `walk`、`stand`／`stop` 显式选择行走或站立策略；
+通过 ZMQ `walk`、`stand`／`stop` 显式选择行走或站立模式；全身配置中的
+`stand` 选择 `stand_mjlab/RL`，静态配置中的 `stand` 进入 `TRAJECTORY`；
 ROS `/cmd_vel` 和 ZMQ 速度命令仅在 `walk_mjlab` 已进入 `RL` 后生效。
 零速度及速度命令超时只清零速度，保持当前行走策略。由于底层只允许在 `POWER_OFF`
 或 `DAMP` 切换策略，节点会先清零速度，等待 `DAMP`，切换模型并等待 Control
 回传，然后按 `HOME → ZERO → RL` 恢复。任何故障、状态断线或请求超时都会
-中止自动恢复；切换期间可按 `F` 请求 `POWER_OFF`。单次 ZMQ 速度命令默认
+中止自动恢复。单次 ZMQ 速度命令默认
 有效 10 秒，ROS `/cmd_vel` 默认超时 0.5 秒，超时后立即清零速度。
 切换期间的速度命令不会缓存；策略就绪后需要发送新的速度命令。
 
-启动 driver 和 control 后，在交互式终端中用该节点替代
-`run_hmi_linglong.sh`：
+启动 driver、control 和 `run_hmi_linglong.sh` 后运行该节点；ROS 节点会读取
+`hmi_runtime` 创建的 connection 文件：
 
 ```bash
 source output/staging/setup.zsh
@@ -119,8 +135,13 @@ ros2 run humanoid humanoid_cmd_vel_hmi_node \
   -p cmd_vel_bias_x:=0.0 \
   -p cmd_vel_bias_y:=0.2 \
   -p cmd_vel_bias_yaw:=0.0 \
+  -p connection_file:="" \
   -p zmq_endpoint:=tcp://127.0.0.1:5565
 ```
+
+`connection_file` 为空时，节点按 YAML 的 `operator_service.connection_file`，或
+`$XDG_STATE_HOME/humanoid-operator/<robot>/connection.json`（未设置时使用
+`$HOME/.local/state/...`）自动定位。ROS 节点和 `hmi_runtime` 必须以同一普通用户运行。
 
 三个速度偏置参数默认均为 `0.0`。收到的 x、y、yaw 只要有一个非零，
 就分别给三个分量加上对应偏置，再按当前策略的速度范围限幅；三个分量全为零时不加偏置。

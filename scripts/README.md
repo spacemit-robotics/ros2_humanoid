@@ -30,15 +30,30 @@ python scripts/asr_simple.py -d 0 -r 48000
 直接通过 ZMQ 查询状态、执行或取消交互动作的消息格式见
 [`ZMQ_ACTIONS.md`](ZMQ_ACTIONS.md)。
 
-先启动 `humanoid_cmd_vel_hmi_node`，并让机器人进入 `stand_mjlab` 策略的
-`RL` 状态。语音脚本只在 HMI 报告在线、无故障、站立策略已生效且没有切换或
-进行中的交互动作时发送请求，不会自动上电或切换到站立模型。
+先启动 `humanoid_cmd_vel_hmi_node`。全身配置需要进入 `stand_mjlab/RL`，
+`linglong_static.yaml` 固定底座配置需要进入 `TRAJECTORY`。语音脚本只在 HMI
+报告在线、无故障、对应动作模式已生效且没有切换或进行中的交互动作时发送请求，
+不会自动上电或切换状态；可先向节点发送 ZMQ `{"op":"stand"}` 自动推进状态机。
 
 可先不接麦克风测试识别映射：
 
 ```bash
 python scripts/asr_action_control.py --text '请挥挥手' --dry-run
 python scripts/asr_action_control.py --text '左手比心' --dry-run
+```
+
+静态实机启动与无麦克风真实动作请求示例：
+
+```bash
+# 终端 1：固定底座核心进程
+run_linglong.sh --real --profile static
+
+# 终端 2：ROS/ZMQ operator 客户端
+ros2 run humanoid humanoid_cmd_vel_hmi_node \
+  "$SDK_ROOT/application/native/humanoid_linglong/config/linglong_static.yaml"
+
+# 终端 3：先发送 {"op":"stand"} 并等待 TRAJECTORY 就绪，再发送文本动作
+python scripts/asr_action_control.py --text '左手比心' --no-audio-prompts
 ```
 
 实时监听并通过 ZMQ 请求动作：

@@ -4,9 +4,13 @@ humanoid_nav_rl_bridge:
     cmd_vel_topic: "/cmd_vel"
     accepted_cmd_vel_timeout_s: 0.5
     publish_rate_hz: 20.0
+    # Empty means the connection file created by hmi_runtime for robot_base.name.
+    connection_file: ""
+    socket_timeout_ms: 1500
+    velocity_ttl_ms: 300
 
     auto_fsm: false
-    auto_policy: "walk"
+    auto_policy: "walk_mjlab"
     auto_request_period_s: 0.5
     require_zero_ready: true
     send_poweroff_on_shutdown: false

@@ -1,821 +1,400 @@
 /**
  * Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
  * SPDX-License-Identifier: Apache-2.0
- *
  * @file humanoid_cmd_vel_hmi_node.cpp
- * @brief Native humanoid HMI with ROS2 Twist velocity input.
+ * @brief ROS Twist and legacy ZMQ adapter for the operator service.
  */
-
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <memory>
+#include <stdexcept>
 #include <string>
-#include <vector>
-#include <cerrno>
 
 #include <nlohmann/json.hpp>
 #include <zmq.h>
 
 #include "geometry_msgs/msg/twist.hpp"
+#include "operator_client.h"
+#include "operator_client_utils.hpp"
 #include "rclcpp/rclcpp.hpp"
 
-// Reuse the native HMI's terminal rendering, key decoding, FSM validation,
-// policy selection and status acknowledgement logic verbatim. Only main is
-// replaced so ROS callbacks can be serviced in the same thread as the UI.
-#define main humanoid_native_hmi_main
-#include HUMANOID_HMI_RUNTIME_SOURCE
-#undef main
+namespace
+{
+using Clock = std::chrono::steady_clock;
 
-namespace {
-
-class CommandSocket {
+class CommandSocket
+{
 public:
-    explicit CommandSocket(const std::string &endpoint) {
-        context_ = zmq_ctx_new();
-        if (!context_) throw std::runtime_error(zmq_strerror(errno));
-        socket_ = zmq_socket(context_, ZMQ_REP);
-        if (socket_) {
-            const int linger = 0;
-            (void)zmq_setsockopt(socket_, ZMQ_LINGER, &linger,
-                sizeof(linger));
-        }
-        if (!socket_ || zmq_bind(socket_, endpoint.c_str()) != 0) {
-            const std::string error = zmq_strerror(errno);
-            if (socket_) zmq_close(socket_);
-            zmq_ctx_term(context_);
-            socket_ = nullptr;
-            context_ = nullptr;
-            throw std::runtime_error("ZMQ bind " + endpoint + ": " + error);
-        }
+  explicit CommandSocket(const std::string & endpoint)
+  {
+    context_ = zmq_ctx_new();
+    if (!context_) {
+      throw std::runtime_error(zmq_strerror(errno));
     }
+    socket_ = zmq_socket(context_, ZMQ_REP);
+    if (socket_) {
+      const int linger = 0;
+      (void)zmq_setsockopt(socket_, ZMQ_LINGER, &linger, sizeof(linger));
+    }
+    if (!socket_ || zmq_bind(socket_, endpoint.c_str()) != 0) {
+      const std::string error = zmq_strerror(errno);
+      if (socket_) {
+        zmq_close(socket_);
+      }
+      zmq_ctx_term(context_);
+      throw std::runtime_error("ZMQ bind " + endpoint + ": " + error);
+    }
+  }
 
-    ~CommandSocket() {
-        if (socket_) zmq_close(socket_);
-        if (context_) zmq_ctx_term(context_);
+  ~CommandSocket()
+  {
+    if (socket_) {
+      zmq_close(socket_);
     }
+    if (context_) {
+      zmq_ctx_term(context_);
+    }
+  }
 
-    template <typename Handler>
-    void Poll(Handler &&handler) {
-        char buffer[4096];
-        const int size = zmq_recv(socket_, buffer, sizeof(buffer), ZMQ_DONTWAIT);
-        if (size < 0) return;
-        nlohmann::json reply;
-        if (size >= static_cast<int>(sizeof(buffer))) {
-            reply = {{"ok", false}, {"error", "request too large"}};
-        } else {
-            try {
-                reply = handler(nlohmann::json::parse(buffer, buffer + size));
-            } catch (const std::exception &error) {
-                reply = {{"ok", false}, {"error", error.what()}};
-            }
-        }
-        const std::string encoded = reply.dump();
-        (void)zmq_send(socket_, encoded.data(), encoded.size(), 0);
+  template<typename Handler>
+  void Poll(Handler && handler)
+  {
+    char buffer[4096];
+    const int size = zmq_recv(socket_, buffer, sizeof(buffer), ZMQ_DONTWAIT);
+    if (size < 0) {
+      return;
     }
+    nlohmann::json reply;
+    if (size >= static_cast<int>(sizeof(buffer))) {
+      reply = {{"ok", false}, {"error", "request too large"}};
+    } else {
+      try {
+        reply = handler(nlohmann::json::parse(buffer, buffer + size));
+      } catch (const std::exception & error) {
+        reply = {{"ok", false}, {"error", error.what()}};
+      }
+    }
+    const std::string encoded = reply.dump();
+    (void)zmq_send(socket_, encoded.data(), encoded.size(), 0);
+  }
 
 private:
-    void *context_ = nullptr;
-    void *socket_ = nullptr;
+  void * context_ = nullptr;
+  void * socket_ = nullptr;
 };
 
+nlohmann::json ReplyJson(const operator_service::Reply & reply)
+{
+  return {{"ok", reply.ok}, {"code", reply.code},
+    {"message", reply.message}};
+}
 }  // namespace
 
-int main(int argc, char *argv[]) {
-    rclcpp::init(argc, argv);
-    std::signal(SIGINT, OnSignal);
-    std::signal(SIGTERM, OnSignal);
-
-    const std::vector<std::string> args = rclcpp::remove_ros_arguments(argc, argv);
-    if (args.size() < 2 || args[1] == "-h" || args[1] == "--help") {
-        fprintf(args.size() < 2 ? stderr : stdout,
-            "用法: %s <config.yaml> [--ros-args -p cmd_vel_topic:=/cmd_vel]\n"
-            "选项:\n"
-            "  <config.yaml>  机器人配置文件路径\n"
-            "  -h, --help     显示此帮助信息\n", argv[0]);
-        rclcpp::shutdown();
-        return args.size() < 2 ? 1 : 0;
-    }
-    const std::string yaml_path = args[1];
-
-    UiConfig config;
-    std::unique_ptr<runtime_logging::Session> logging_session;
-    try {
-        config = LoadUiConfig(yaml_path);
-        const auto yaml_file = robot_base::YamlFile::Load(yaml_path);
-        logging_session = std::make_unique<runtime_logging::Session>(
-            yaml_file, yaml_path, "ros_hmi", false);
-    } catch (const std::exception &e) {
-        fprintf(stderr, "%s\n用法: %s <config.yaml>\n", e.what(), argv[0]);
-        rclcpp::shutdown();
-        return 1;
-    }
-
-    auto transport = transport::CreateV2(yaml_path);
-    if (!transport->Init(yaml_path, transport::Role::HMI)) {
-        runtime_logging::Log(runtime_logging::Level::kError,
-            "ROS HMI transport initialization failed", false);
-        fprintf(stderr, "[humanoid_cmd_vel_hmi] 传输初始化失败\n");
-        rclcpp::shutdown();
-        return 1;
-    }
-
-    // This node is deliberately receive-only on the ROS graph. Disable the
-    // implicit rosout/parameter publishers and parameter service endpoints.
-    rclcpp::NodeOptions node_options;
-    node_options.enable_rosout(false)
-        .start_parameter_event_publisher(false)
-        .start_parameter_services(false);
-    auto node = std::make_shared<rclcpp::Node>(
-        "humanoid_cmd_vel_hmi", node_options);
+class HumanoidCmdVelClient : public rclcpp::Node
+{
+public:
+  explicit HumanoidCmdVelClient(const std::string & robot_config_path)
+  : Node("humanoid_cmd_vel_hmi")
+  {
     const std::string cmd_vel_topic =
-        node->declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel");
-    const double cmd_vel_timeout_s = std::max(0.1,
-        node->declare_parameter<double>("cmd_vel_timeout_s", 0.5));
-    const double cmd_vel_bias_x =
-        node->declare_parameter<double>("cmd_vel_bias_x", 0.0);
-    const double cmd_vel_bias_y =
-        node->declare_parameter<double>("cmd_vel_bias_y", 0.0);
-    const double cmd_vel_bias_yaw =
-        node->declare_parameter<double>("cmd_vel_bias_yaw", 0.0);
-    const std::string zmq_endpoint = node->declare_parameter<std::string>(
-        "zmq_endpoint", "tcp://127.0.0.1:5565");
-    std::unique_ptr<CommandSocket> command_socket;
-    try {
-        command_socket = std::make_unique<CommandSocket>(zmq_endpoint);
-    } catch (const std::exception &error) {
-        fprintf(stderr, "[humanoid_cmd_vel_hmi] %s\n", error.what());
-        rclcpp::shutdown();
-        return 1;
+      declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel");
+    cmd_vel_timeout_s_ =
+      std::max(0.1, declare_parameter<double>("cmd_vel_timeout_s", 0.5));
+    bias_x_ = declare_parameter<double>("cmd_vel_bias_x", 0.0);
+    bias_y_ = declare_parameter<double>("cmd_vel_bias_y", 0.0);
+    bias_yaw_ = declare_parameter<double>("cmd_vel_bias_yaw", 0.0);
+    velocity_ttl_ms_ = static_cast<int>(std::clamp<int64_t>(
+        declare_parameter<int64_t>("velocity_ttl_ms", 300), 50, 1000));
+    request_period_s_ = std::max(
+      0.1,
+      declare_parameter<double>("request_period_s", 0.5));
+    const int socket_timeout_ms = static_cast<int>(std::clamp<int64_t>(
+        declare_parameter<int64_t>("socket_timeout_ms", 1500),
+        100, 10000));
+    walk_policy_ =
+      declare_parameter<std::string>("walk_policy", "walk_mjlab");
+    stand_policy_ =
+      declare_parameter<std::string>("stand_policy", "stand_mjlab");
+    const std::string connection_file = humanoid_operator::ConnectionFile(
+      robot_config_path,
+      declare_parameter<std::string>("connection_file", ""));
+    humanoid_operator::Connect(
+      &client_, connection_file, "ros_cmd_vel", socket_timeout_ms);
+    const auto acquire = client_.AcquireControl();
+    if (!acquire.ok) {
+      throw std::runtime_error(
+              "cannot acquire operator control: " +
+              acquire.code + ": " + acquire.message);
     }
 
-    runtime_logging::Log(runtime_logging::Level::kInfo,
-        "ROS cmd_vel HMI started: topic=" + cmd_vel_topic, false);
-
-    g_color_enabled = isatty(STDOUT_FILENO) && std::getenv("NO_COLOR") == nullptr;
-    Terminal terminal;
-
-    UiState state;
-    state.policies = config.policies;
-    state.manual_reference_policies = config.manual_reference_policies;
-    state.interaction_actions = config.interaction_actions;
-    state.command_limits = config.command_limits;
-    state.active_policy_idx = config.default_policy_idx;
-    state.policy_cursor_idx = config.default_policy_idx;
-
-    const bool mode_switch_available =
-        std::find(config.policies.begin(), config.policies.end(),
-            "stand_mjlab") != config.policies.end() &&
-        std::find(config.policies.begin(), config.policies.end(),
-            "walk_mjlab") != config.policies.end();
-    enum class SwitchStage { IDLE, TO_DAMP, SWITCH, TO_HOME, TO_ZERO, TO_RL };
-    SwitchStage switch_stage = SwitchStage::IDLE;
-    std::string desired_policy;
-    std::string blocked_policy;
-    std::string switch_target;
-    Clock::time_point switch_started_at{};
-
-    bool have_ros_command = false;
-    bool ros_command_pending = false;
-    bool ros_dirty = false;
-    Clock::time_point last_ros_command_at{};
-    Clock::time_point voice_override_until{};
-    double active_command_timeout_s = cmd_vel_timeout_s;
-    const auto set_desired_policy = [&](const std::string &next_policy) {
-        if (next_policy != desired_policy) blocked_policy.clear();
-        desired_policy = next_policy;
-    };
-    const auto walk_ready = [&]() {
-        return state.status_online && state.status.hmi_connected &&
-            !state.fault.latched && state.status.mode == ControlMode::RL &&
-            state.status.active_policy == "walk_mjlab" &&
-            (desired_policy.empty() || desired_policy == "walk_mjlab") &&
-            switch_stage == SwitchStage::IDLE &&
-            ActiveCommandLimits(state) != nullptr;
-    };
-    const auto apply_velocity = [&](double vx, double vy, double wz,
-            const char *source, double timeout_s) {
-        if (!std::isfinite(vx) || !std::isfinite(vy) ||
-            !std::isfinite(wz) || !walk_ready()) {
-            return false;
+    const std::string zmq_endpoint = declare_parameter<std::string>(
+      "zmq_endpoint", "tcp://127.0.0.1:5565");
+    command_socket_ = std::make_unique<CommandSocket>(zmq_endpoint);
+    cmd_sub_ = create_subscription<geometry_msgs::msg::Twist>(
+      cmd_vel_topic, rclcpp::SystemDefaultsQoS(),
+      [this](const geometry_msgs::msg::Twist::SharedPtr message)
+      {
+        if (Clock::now() < voice_override_until_) {
+          return;
         }
-        const bool moving = vx != 0.0 || vy != 0.0 || wz != 0.0;
-        const auto *limits = ActiveCommandLimits(state);
-        state.target_command.vx = std::clamp(static_cast<float>(vx +
-            (moving ? cmd_vel_bias_x : 0.0)),
-            limits->min_vx, limits->max_vx);
-        state.target_command.vy = std::clamp(static_cast<float>(vy +
-            (moving ? cmd_vel_bias_y : 0.0)),
-            limits->min_vy, limits->max_vy);
-        state.target_command.wz = std::clamp(static_cast<float>(wz +
-            (moving ? cmd_vel_bias_yaw : 0.0)),
-            limits->min_wz, limits->max_wz);
-        state.last_action = std::string(source) + " 已更新速度目标";
-        have_ros_command = true;
-        last_ros_command_at = Clock::now();
-        active_command_timeout_s = timeout_s;
-        ros_command_pending = true;
-        ros_dirty = true;
-        return true;
-    };
-    auto cmd_vel_sub = node->create_subscription<geometry_msgs::msg::Twist>(
-        cmd_vel_topic, rclcpp::SystemDefaultsQoS(),
-        [&](const geometry_msgs::msg::Twist::SharedPtr msg) {
-            if (Clock::now() < voice_override_until) return;
-            (void)apply_velocity(msg->linear.x, msg->linear.y,
-                msg->angular.z, "ROS cmd_vel", cmd_vel_timeout_s);
-        });
-    (void)cmd_vel_sub;
+        SetTarget(
+          message->linear.x, message->linear.y,
+          message->angular.z, cmd_vel_timeout_s_);
+      });
+    timer_ = create_wall_timer(
+      std::chrono::milliseconds(20), [this]() {Tick();});
+    RCLCPP_INFO(
+      get_logger(),
+      "Connected to hmi_runtime via %s; cmd_vel=%s ZMQ=%s",
+      connection_file.c_str(), cmd_vel_topic.c_str(),
+      zmq_endpoint.c_str());
+  }
 
-    const double heartbeat_period = 1.0 / config.hmi.heartbeat_hz;
-    auto last_command_at = Clock::now() -
-        std::chrono::duration_cast<Clock::duration>(
-            std::chrono::duration<double>(heartbeat_period));
-    bool dirty = true;
-    std::string last_logged_action;
-
-    while (g_running && rclcpp::ok()) {
-        rclcpp::spin_some(node);
-        command_socket->Poll([&](const nlohmann::json &request) {
-            if (!request.is_object()) {
-                return nlohmann::json{{"ok", false},
-                    {"error", "request must be a JSON object"}};
-            }
-            const std::string op = request.value("op", std::string{});
-            if (op == "status") {
-                return nlohmann::json{{"ok", true},
-                    {"online", state.status_online},
-                    {"mode", ModeName(state.status.mode)},
-                    {"policy", state.status.active_policy},
-                    {"desired_policy", desired_policy},
-                    {"switching", switch_stage != SwitchStage::IDLE},
-                    {"interaction_phase", InteractionPhaseName(
-                        state.status.interaction.phase)},
-                    {"fault", state.fault.latched}};
-            }
-            if (op == "walk" || op == "stand" || op == "stop") {
-                if (!mode_switch_available || !state.status_online ||
-                    !state.status.hmi_connected || state.fault.latched ||
-                    state.status.mode == ControlMode::POWER_OFF ||
-                    state.status.mode == ControlMode::SAFETY) {
-                    return nlohmann::json{{"ok", false},
-                        {"error", "Control state does not allow mode switching"}};
-                }
-                ZeroVelocity(&state);
-                have_ros_command = false;
-                voice_override_until = Clock::time_point{};
-                ros_command_pending = true;
-                ros_dirty = true;
-                if (InteractionIsBusy(state.status.interaction.phase)) {
-                    ros_command_pending = RequestInteractionCancel(
-                        &state, Clock::now()) || ros_command_pending;
-                }
-                set_desired_policy(op == "walk" ?
-                    "walk_mjlab" : "stand_mjlab");
-                blocked_policy.clear();
-                return nlohmann::json{{"ok", true},
-                    {"desired_policy", desired_policy}};
-            }
-            if (op == "velocity" || op == "forward") {
-                if (!walk_ready()) {
-                    return nlohmann::json{{"ok", false},
-                        {"error", "walk_mjlab/RL is not ready"}};
-                }
-                const double vx = op == "forward" ?
-                    request.value("vx", 0.2) : request.value("vx", 0.0);
-                const double vy = op == "velocity" ? request.value("vy", 0.0) : 0.0;
-                const double wz = op == "velocity" ? request.value("wz", 0.0) : 0.0;
-                const double duration_s = request.value("duration_s", 10.0);
-                if (!std::isfinite(duration_s) || duration_s < 0.1 ||
-                    duration_s > 30.0) {
-                    return nlohmann::json{{"ok", false},
-                        {"error", "duration_s must be in [0.1, 30]"}};
-                }
-                const bool accepted = apply_velocity(
-                    vx, vy, wz, "ZMQ", duration_s);
-                if (accepted) {
-                    voice_override_until = Clock::now() +
-                        std::chrono::duration_cast<Clock::duration>(
-                            std::chrono::duration<double>(duration_s));
-                }
-                return nlohmann::json{{"ok", accepted},
-                    {"desired_policy", desired_policy}};
-            }
-            if (op == "wave" || op == "interaction") {
-                const std::string action_key = op == "wave" ? "wave_hello" :
-                    request.value("action", std::string{});
-                const auto actions = config.interaction_actions.find(
-                    "stand_mjlab");
-                if (action_key.empty() ||
-                    actions == config.interaction_actions.end() ||
-                    std::none_of(actions->second.begin(), actions->second.end(),
-                        [&](const InteractionAction &action) {
-                            return action.key == action_key;
-                        })) {
-                    return nlohmann::json{{"ok", false},
-                        {"error", "action is not available on stand_mjlab"}};
-                }
-                if (!state.status_online || !state.status.hmi_connected ||
-                    state.fault.latched || state.status.mode != ControlMode::RL ||
-                    state.status.active_policy != "stand_mjlab" ||
-                    (!desired_policy.empty() && desired_policy != "stand_mjlab") ||
-                    switch_stage != SwitchStage::IDLE) {
-                    return nlohmann::json{{"ok", false},
-                        {"error", "stand_mjlab/RL is not ready"}};
-                }
-                const auto *active_actions = ActiveInteractionActions(state);
-                const auto action = active_actions ? std::find_if(
-                    active_actions->begin(), active_actions->end(),
-                    [&](const InteractionAction &candidate) {
-                        return candidate.key == action_key;
-                    }) : std::vector<InteractionAction>::const_iterator{};
-                const bool accepted = active_actions && action != active_actions->end() &&
-                    RequestInteractionStart(&state, *action, Clock::now());
-                ros_command_pending = ros_command_pending || accepted;
-                ros_dirty = true;
-                return nlohmann::json{{"ok", accepted},
-                    {"action", action_key}, {"message", state.last_action}};
-            }
-            if (op == "cancel") {
-                const bool accepted = RequestInteractionCancel(
-                    &state, Clock::now());
-                ros_command_pending = ros_command_pending || accepted;
-                ros_dirty = true;
-                return nlohmann::json{{"ok", accepted},
-                    {"message", state.last_action}};
-            }
-            return nlohmann::json{{"ok", false},
-                {"error", "unknown op"}};
-        });
-        const auto now = Clock::now();
-        bool send_immediately = ros_command_pending;
-        ros_command_pending = false;
-        dirty = dirty || ros_dirty;
-        ros_dirty = false;
-
-        if (have_ros_command &&
-            std::chrono::duration<double>(now - last_ros_command_at).count() >
-                active_command_timeout_s) {
-            have_ros_command = false;
-            if (std::abs(state.target_command.vx) > 1e-6f ||
-                std::abs(state.target_command.vy) > 1e-6f ||
-                std::abs(state.target_command.wz) > 1e-6f) {
-                ZeroVelocity(&state);
-                state.last_action = "速度命令超时，速度已清零";
-                send_immediately = true;
-                dirty = true;
-            }
-        }
-
-        robot_base::ControlStatus latest_status;
-        robot_base::FaultStatus latest_fault;
-        bool received_status = false;
-        while (transport->RecvStatusV2(latest_status, latest_fault))
-            received_status = true;
-        if (received_status) {
-            const bool status_changed =
-                StatusChanged(state, latest_status, latest_fault);
-            ProcessStatus(
-                &state, latest_status, latest_fault, now, &send_immediately);
-            dirty = dirty || status_changed || send_immediately;
-        }
-
-        const bool waiting_for_ack = state.transition.active ||
-            !state.pending_policy.empty() ||
-            state.target_command.interaction.operation !=
-                robot_base::InteractionRequest::Operation::NONE;
-        const double effective_status_timeout = waiting_for_ack
-            ? std::max(config.hmi.status_timeout, config.hmi.request_timeout)
-            : config.hmi.status_timeout;
-        const bool online = state.has_status &&
-            std::chrono::duration<double>(now - state.last_status_at).count()
-                <= effective_status_timeout;
-        if (online != state.status_online) {
-            state.status_online = online;
-            dirty = true;
-            if (!online) {
-                if (switch_stage != SwitchStage::IDLE) {
-                    blocked_policy = desired_policy;
-                    switch_stage = SwitchStage::IDLE;
-                }
-                state.transition.active = false;
-                state.pending_policy.clear();
-                state.fault_ack_sequence = 0;
-                state.reference_start_pulse = false;
-                state.reference_start_requested = false;
-                state.target_command.interaction.operation =
-                    robot_base::InteractionRequest::Operation::NONE;
-                state.target_command.interaction.action.clear();
-                ZeroVelocity(&state);
-                have_ros_command = false;
-                if (state.page == HmiPage::VELOCITY ||
-                    state.page == HmiPage::INTERACTION_SELECT) {
-                    state.page = HmiPage::MAIN;
-                }
-                state.last_action = "Control 状态回传超时，速度已清零";
-                send_immediately = true;
-            } else {
-                state.last_action = "Control 状态通道已连接";
-            }
-        }
-
-        if (state.transition.active &&
-            std::chrono::duration<double>(now - state.transition.requested_at).count()
-                > config.hmi.request_timeout) {
-            state.transition.active = false;
-            if (switch_stage != SwitchStage::IDLE) {
-                blocked_policy = desired_policy;
-                switch_stage = SwitchStage::IDLE;
-            }
-            state.last_action = "FSM 请求超时，已停止重发";
-            send_immediately = true;
-            dirty = true;
-        }
-        if (!state.pending_policy.empty() &&
-            std::chrono::duration<double>(now - state.policy_requested_at).count()
-                > config.hmi.request_timeout) {
-            state.pending_policy.clear();
-            if (switch_stage != SwitchStage::IDLE) {
-                blocked_policy = desired_policy;
-                switch_stage = SwitchStage::IDLE;
-            }
-            state.last_action = "策略切换未获 Control 确认，已停止重发";
-            send_immediately = true;
-            dirty = true;
-        }
-
-        if (state.target_command.interaction.operation !=
-                robot_base::InteractionRequest::Operation::NONE &&
-            std::chrono::duration<double>(
-                now - state.interaction_requested_at).count() >
-                config.hmi.request_timeout) {
-            state.target_command.interaction.operation =
-                robot_base::InteractionRequest::Operation::NONE;
-            state.target_command.interaction.action.clear();
-            state.last_action = "交互动作请求超时，已停止重发";
-            send_immediately = true;
-            dirty = true;
-        }
-
-        if (state.highlighted_key >= 0 && now >= state.highlight_until) {
-            state.highlighted_key = -1;
-            dirty = true;
-        }
-
-        if (state.reference_start_pulse &&
-            now >= state.reference_start_until) {
-            state.reference_start_pulse = false;
-            send_immediately = true;
-            dirty = true;
-        }
-
-        if (switch_stage != SwitchStage::IDLE &&
-            (!state.status_online || state.fault.latched ||
-                state.status.mode == ControlMode::SAFETY ||
-                std::chrono::duration<double>(now - switch_started_at).count()
-                    > 4.0 * config.hmi.request_timeout)) {
-            blocked_policy = desired_policy;
-            switch_stage = SwitchStage::IDLE;
-            state.transition.active = false;
-            state.pending_policy.clear();
-            ZeroVelocity(&state);
-            state.last_action = "自动切换已停止：状态、安全条件或超时";
-            send_immediately = true;
-            dirty = true;
-        }
-        if (mode_switch_available && switch_stage == SwitchStage::IDLE &&
-            !desired_policy.empty() && desired_policy != blocked_policy &&
-            state.status_online && !state.fault.latched &&
-            state.status.mode != ControlMode::SAFETY &&
-            state.status.mode != ControlMode::POWER_OFF &&
-            (state.status.active_policy != desired_policy ||
-                state.status.mode != ControlMode::RL) &&
-            !state.transition.active && state.pending_policy.empty()) {
-            switch_target = desired_policy;
-            if (state.status.active_policy == switch_target) {
-                switch (state.status.mode) {
-                case ControlMode::DAMP:
-                    switch_stage = SwitchStage::TO_HOME;
-                    break;
-                case ControlMode::HOME:
-                    switch_stage = SwitchStage::TO_ZERO;
-                    break;
-                case ControlMode::ZERO:
-                    switch_stage = SwitchStage::TO_RL;
-                    break;
-                default:
-                    switch_stage = SwitchStage::TO_DAMP;
-                    break;
-                }
-            } else {
-                switch_stage = SwitchStage::TO_DAMP;
-            }
-            switch_started_at = now;
-            ZeroVelocity(&state);
-            send_immediately = true;
-            dirty = true;
-        }
-        if (switch_stage != SwitchStage::IDLE &&
-            !state.transition.active && state.pending_policy.empty()) {
-            switch (switch_stage) {
-            case SwitchStage::TO_DAMP:
-                if (state.status.mode == ControlMode::DAMP) {
-                    switch_stage = SwitchStage::SWITCH;
-                } else if (RequestTransition(
-                    &state, ControlMode::DAMP, 1, now)) {
-                    send_immediately = true;
-                }
-                break;
-            case SwitchStage::SWITCH:
-                if (state.status.active_policy == switch_target) {
-                    switch_stage = SwitchStage::TO_HOME;
-                } else if (state.status.mode == ControlMode::DAMP) {
-                    switch_target = desired_policy;
-                    state.pending_policy = switch_target;
-                    state.policy_source = state.status.active_policy;
-                    state.policy_requested_at = now;
-                    state.last_action = "自动请求切换策略 → " + switch_target;
-                    send_immediately = true;
-                }
-                break;
-            case SwitchStage::TO_HOME:
-                if (state.status.mode == ControlMode::HOME) {
-                    switch_stage = SwitchStage::TO_ZERO;
-                } else if (state.status.mode == ControlMode::DAMP &&
-                    RequestTransition(&state, ControlMode::HOME, 4, now)) {
-                    send_immediately = true;
-                }
-                break;
-            case SwitchStage::TO_ZERO:
-                if (state.status.mode == ControlMode::ZERO) {
-                    switch_stage = SwitchStage::TO_RL;
-                } else if (state.status.mode == ControlMode::HOME &&
-                    RequestTransition(&state, ControlMode::ZERO, 2, now)) {
-                    send_immediately = true;
-                }
-                break;
-            case SwitchStage::TO_RL:
-                if (state.status.mode == ControlMode::RL) {
-                    switch_stage = SwitchStage::IDLE;
-                    state.last_action = "自动切换完成 → " +
-                        state.status.active_policy;
-                    dirty = true;
-                } else if (state.status.mode == ControlMode::ZERO &&
-                    state.status.zero_ready &&
-                    RequestTransition(&state, ControlMode::RL, 3, now)) {
-                    send_immediately = true;
-                }
-                break;
-            case SwitchStage::IDLE:
-                break;
-            }
-        }
-        const int key = ReadUiKey();
-        if (key >= 0) {
-            dirty = true;
-            if (key == 'f') {
-                desired_policy.clear();
-                blocked_policy.clear();
-                if (switch_stage != SwitchStage::IDLE) {
-                    switch_stage = SwitchStage::IDLE;
-                    state.pending_policy.clear();
-                    state.transition.active = false;
-                    ZeroVelocity(&state);
-                }
-                send_immediately = RequestShortcut(&state, key, now) ||
-                    send_immediately;
-            } else if (key == 'x') {
-                send_immediately = RequestFaultAcknowledgement(&state) ||
-                    send_immediately;
-            } else if (key == 'c') {
-                send_immediately = RequestInteractionCancel(&state, now) ||
-                    send_immediately;
-            } else if (switch_stage != SwitchStage::IDLE) {
-                state.last_action = "自动切换进行中，请等待 Control 确认";
-            } else if (state.page == HmiPage::POLICY_SELECT) {
-                if ((key == kKeyUp || key == 'k') && !state.policies.empty()) {
-                    state.policy_cursor_idx = (state.policy_cursor_idx - 1 +
-                        static_cast<int>(state.policies.size())) %
-                        static_cast<int>(state.policies.size());
-                } else if ((key == kKeyDown || key == 'j') &&
-                    !state.policies.empty()) {
-                    state.policy_cursor_idx = (state.policy_cursor_idx + 1) %
-                        static_cast<int>(state.policies.size());
-                } else if ((key == '\r' || key == '\n') &&
-                    !state.policies.empty()) {
-                    if (!state.status_online) {
-                        state.last_action = "策略未切换：Control 状态已断开";
-                    } else if (state.fault.latched) {
-                        state.last_action = "策略未切换：存在锁存故障";
-                    } else if (state.status.mode != ControlMode::POWER_OFF &&
-                        state.status.mode != ControlMode::DAMP) {
-                        state.last_action =
-                            "策略未切换：请先进入 POWER_OFF 或 DAMP";
-                    } else if (state.policy_cursor_idx ==
-                        state.active_policy_idx) {
-                        state.last_action = "所选策略已经生效";
-                        state.page = HmiPage::MAIN;
-                    } else {
-                        desired_policy.clear();
-                        blocked_policy.clear();
-                        state.pending_policy =
-                            state.policies[state.policy_cursor_idx];
-                        state.policy_source = state.status.active_policy;
-                        state.policy_requested_at = now;
-                        state.last_action = "请求切换策略 → "
-                            + state.pending_policy + "，等待 Control 确认";
-                        state.page = HmiPage::MAIN;
-                        send_immediately = true;
-                    }
-                } else if (key == kKeyEscape || key == 'p') {
-                    state.policy_cursor_idx = state.active_policy_idx;
-                    state.page = HmiPage::MAIN;
-                    state.last_action = "取消策略选择";
-                }
-            } else if (state.page == HmiPage::INTERACTION_SELECT) {
-                const auto *actions = ActiveInteractionActions(state);
-                const int count = actions
-                    ? static_cast<int>(actions->size()) : 0;
-                if ((key == kKeyUp || key == 'k') && count > 0) {
-                    state.interaction_cursor_idx =
-                        (state.interaction_cursor_idx - 1 + count) % count;
-                } else if ((key == kKeyDown || key == 'j') && count > 0) {
-                    state.interaction_cursor_idx =
-                        (state.interaction_cursor_idx + 1) % count;
-                } else if ((key == '\r' || key == '\n') && count > 0) {
-                    const bool started = RequestInteractionStart(&state,
-                        (*actions)[state.interaction_cursor_idx], now);
-                    send_immediately = started || send_immediately;
-                } else if (key == kKeyEscape || key == 'a') {
-                    state.page = HmiPage::MAIN;
-                    state.last_action = "取消交互动作选择";
-                }
-            } else if (state.page == HmiPage::VELOCITY) {
-                const auto *limits = ActiveCommandLimits(state);
-                if (key == kKeyEscape || key == 'v') {
-                    ZeroVelocity(&state);
-                    have_ros_command = false;
-                    state.page = HmiPage::MAIN;
-                    state.last_action = "退出速度控制，速度清零";
-                    send_immediately = true;
-                } else if (!limits) {
-                    ZeroVelocity(&state);
-                    state.page = HmiPage::MAIN;
-                    state.last_action = "当前策略未配置速度命令范围";
-                    send_immediately = true;
-                } else if (key == 'w') {
-                    state.target_command.vx = std::clamp(
-                        state.target_command.vx + config.hmi.step_vx,
-                        limits->min_vx, limits->max_vx);
-                    state.last_action = "W：增加前进速度";
-                    send_immediately = true;
-                } else if (key == 's') {
-                    state.target_command.vx = std::clamp(
-                        state.target_command.vx - config.hmi.step_vx,
-                        limits->min_vx, limits->max_vx);
-                    state.last_action = "S：增加后退速度";
-                    send_immediately = true;
-                } else if (key == 'a') {
-                    state.target_command.vy = std::clamp(
-                        state.target_command.vy + config.hmi.step_vy,
-                        limits->min_vy, limits->max_vy);
-                    state.last_action = "A：增加左移速度";
-                    send_immediately = true;
-                } else if (key == 'd') {
-                    state.target_command.vy = std::clamp(
-                        state.target_command.vy - config.hmi.step_vy,
-                        limits->min_vy, limits->max_vy);
-                    state.last_action = "D：增加右移速度";
-                    send_immediately = true;
-                } else if (key == 'q') {
-                    state.target_command.wz = std::clamp(
-                        state.target_command.wz + config.hmi.step_wz,
-                        limits->min_wz, limits->max_wz);
-                    state.last_action = "Q：增加左转角速度";
-                    send_immediately = true;
-                } else if (key == 'e') {
-                    state.target_command.wz = std::clamp(
-                        state.target_command.wz - config.hmi.step_wz,
-                        limits->min_wz, limits->max_wz);
-                    state.last_action = "E：增加右转角速度";
-                    send_immediately = true;
-                } else if (key == ' ') {
-                    ZeroVelocity(&state);
-                    have_ros_command = false;
-                    state.last_action = "SPACE：速度清零";
-                    send_immediately = true;
-                }
-                if (send_immediately && (key == 'w' || key == 's' ||
-                    key == 'a' || key == 'd' || key == 'q' ||
-                    key == 'e' || key == ' ')) {
-                    state.highlighted_key = key;
-                    state.highlight_until = now + std::chrono::milliseconds(
-                        config.hmi.key_highlight_ms);
-                }
-            } else {
-                if (key == 'g') {
-                    send_immediately = RequestReferenceStart(&state, now) ||
-                        send_immediately;
-                } else if (key == kKeyLeft) {
-                    send_immediately = RequestByArrow(&state, false, now) ||
-                        send_immediately;
-                } else if (key == kKeyRight) {
-                    send_immediately = RequestByArrow(&state, true, now) ||
-                        send_immediately;
-                } else if (key == 'p') {
-                    if (state.policies.empty()) {
-                        state.last_action = "没有配置可选策略";
-                    } else {
-                        state.policy_cursor_idx = state.active_policy_idx;
-                        state.page = HmiPage::POLICY_SELECT;
-                        state.last_action = "选择策略";
-                    }
-                } else if (key == 'a') {
-                    const auto *actions = ActiveInteractionActions(state);
-                    if (!actions || actions->empty()) {
-                        state.last_action = "当前策略没有注册交互动作";
-                    } else if (!state.status_online ||
-                        !state.status.hmi_connected ||
-                        state.status.mode != ControlMode::RL) {
-                        state.last_action =
-                            "交互动作页仅在真实 FSM=RL 且心跳正常时开放";
-                    } else {
-                        state.page = HmiPage::INTERACTION_SELECT;
-                        state.last_action = "选择交互动作";
-                    }
-                } else if (key == 'v' || key == '\r' || key == '\n') {
-                    if (state.status_online && state.status.hmi_connected &&
-                        state.status.mode == ControlMode::RL &&
-                        ActiveCommandLimits(state)) {
-                        state.page = HmiPage::VELOCITY;
-                        state.last_action = "进入键盘/ROS 速度控制";
-                    } else if (state.status_online &&
-                        state.status.mode == ControlMode::RL) {
-                        state.last_action =
-                            "当前策略未配置 command.limits，不接受速度命令";
-                    } else {
-                        state.last_action =
-                            "速度页仅在真实 FSM=RL 且心跳正常时开放";
-                    }
-                } else if (key == 'o' || key == 'h' || key == 'z' ||
-                    key == 'r') {
-                    send_immediately = RequestShortcut(&state, key, now) ||
-                        send_immediately;
-                } else if (key == ' ') {
-                    ZeroVelocity(&state);
-                    have_ros_command = false;
-                    state.last_action = "速度清零";
-                    send_immediately = true;
-                } else if (key == 'w' || key == 's' || key == 'a' ||
-                    key == 'd' || key == 'q' || key == 'e') {
-                    state.last_action = "请按 V 或 Enter 进入速度控制页";
-                }
-            }
-        }
-
-        if (!state.last_action.empty() && state.last_action != last_logged_action) {
-            runtime_logging::Log(runtime_logging::Level::kInfo,
-                state.last_action, false);
-            last_logged_action = state.last_action;
-        }
-
-        if (send_immediately ||
-            std::chrono::duration<double>(now - last_command_at).count() >=
-                heartbeat_period) {
-            if (SendCommand(transport.get(), &state)) {
-                dirty = true;
-                last_logged_action = state.last_action;
-            }
-            last_command_at = now;
-        }
-
-        if (dirty) {
-            Render(state);
-            dirty = false;
-        }
-        usleep(5000);
+  ~HumanoidCmdVelClient() override
+  {
+    if (client_.Connected()) {
+      (void)client_.Stop();
     }
+  }
 
-    state.transition.active = true;
-    state.transition.key = -1;
-    state.pending_policy.clear();
-    state.fault_ack_sequence = 0;
-    state.reference_start_pulse = false;
-    state.reference_start_requested = false;
-    state.target_command.interaction.sequence =
-        NextInteractionSequence(state);
-    state.target_command.interaction.operation =
-        robot_base::InteractionRequest::Operation::CANCEL;
-    state.target_command.interaction.action.clear();
-    ZeroVelocity(&state);
-    (void)SendCommand(transport.get(), &state);
-    runtime_logging::Log(
-        state.command_send_failed ? runtime_logging::Level::kWarning
-            : runtime_logging::Level::kInfo,
-        state.command_send_failed
-            ? "ROS HMI stopped; POWER_OFF request send failed, control timeout is fallback"
-            : "ROS HMI stopped after requesting POWER_OFF",
-        false);
+private:
+  bool SetTarget(double vx, double vy, double wz, double timeout_s)
+  {
+    if (!std::isfinite(vx) || !std::isfinite(vy) || !std::isfinite(wz)) {
+      return false;
+    }
+    const bool moving = vx != 0.0 || vy != 0.0 || wz != 0.0;
+    target_ = {vx + (moving ? bias_x_ : 0.0),
+      vy + (moving ? bias_y_ : 0.0),
+      wz + (moving ? bias_yaw_ : 0.0)};
+    command_until_ = Clock::now() +
+      std::chrono::duration_cast<Clock::duration>(
+      std::chrono::duration<double>(timeout_s));
+    return true;
+  }
+
+  void Tick()
+  {
+    command_socket_->Poll(
+      [this](const nlohmann::json & request) {return Handle(request);});
+    const auto now = Clock::now();
+    const auto status = client_.LatestStatus();
+    if (!client_.Connected()) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "operator service disconnected: %s",
+        client_.LastError().c_str());
+      return;
+    }
+    if (status.owns_control &&
+      now - last_renew_ >= std::chrono::milliseconds(250))
+    {
+      const auto reply = client_.RenewControl();
+      if (!reply.ok) {
+        RCLCPP_WARN(
+          get_logger(), "control renewal failed: %s",
+          reply.message.c_str());
+      }
+      last_renew_ = now;
+    }
+    AdvancePolicy(status, now);
+    if (now - last_velocity_send_ < std::chrono::milliseconds(100)) {
+      return;
+    }
+    operator_service::Velocity command;
+    const bool ready = status.online && status.owns_control &&
+      status.state == "RL" && status.policy == walk_policy_;
+    if (!status.online || !status.owns_control || status.state != "RL") {
+      last_velocity_send_ = now;
+      return;
+    }
+    if (ready && now <= command_until_) {
+      command = target_;
+    }
+    const auto reply = client_.SetVelocity(command, velocity_ttl_ms_);
+    if (!reply.ok) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "velocity rejected: %s", reply.message.c_str());
+    }
+    last_velocity_send_ = now;
+  }
+
+  void AdvancePolicy(
+    const operator_service::Status & status,
+    const Clock::time_point & now)
+  {
+    if ((!desired_trajectory_ && desired_policy_.empty()) || !status.online ||
+      !status.owns_control || status.fault.latched ||
+      humanoid_operator::RequestPending(status) ||
+      now - last_request_ <
+      std::chrono::duration_cast<Clock::duration>(
+        std::chrono::duration<double>(request_period_s_)))
+    {
+      return;
+    }
+    operator_service::Reply reply;
+    bool requested = true;
+    if (desired_trajectory_) {
+      if (status.state == "POWER_OFF") {
+        reply = client_.RequestState("DAMP");
+      } else if (status.state == "DAMP") {
+        reply = client_.RequestState("HOME");
+      } else if (status.state == "HOME") {
+        reply = client_.RequestState("ZERO");
+      } else if (status.state == "ZERO" && status.zero_ready) {
+        reply = client_.RequestState("TRAJECTORY");
+      } else if (status.state == "TRAJECTORY") {
+        desired_trajectory_ = false;
+        requested = false;
+      } else {
+        reply = client_.RequestState("DAMP");
+      }
+    } else if (status.policy != desired_policy_ && status.state != "POWER_OFF" &&
+      status.state != "DAMP")
+    {
+      reply = client_.RequestState("DAMP");
+    } else if (status.policy != desired_policy_) {
+      reply = client_.SelectPolicy(desired_policy_);
+    } else if (status.state == "POWER_OFF") {
+      reply = client_.RequestState("DAMP");
+    } else if (status.state == "DAMP") {
+      reply = client_.RequestState("HOME");
+    } else if (status.state == "HOME") {
+      reply = client_.RequestState("ZERO");
+    } else if (status.state == "ZERO" && status.zero_ready) {
+      reply = client_.RequestState("RL");
+    } else if (status.state == "RL") {
+      desired_policy_.clear();
+      requested = false;
+    } else {
+      requested = false;
+    }
+    if (requested) {
+      last_request_ = now;
+      if (!reply.ok && reply.code != "busy") {
+        RCLCPP_WARN(
+          get_logger(), "automatic transition failed: %s",
+          reply.message.c_str());
+      }
+    }
+  }
+
+  nlohmann::json Handle(const nlohmann::json & request)
+  {
+    if (!request.is_object()) {
+      return {{"ok", false}, {"error", "request must be an object"}};
+    }
+    const std::string operation = request.value("op", std::string{});
+    const auto status = client_.LatestStatus();
+    if (operation == "status") {
+      return {{"ok", true}, {"online", status.online},
+        {"mode", status.state}, {"policy", status.policy},
+        {"trajectory_enabled", status.trajectory_enabled},
+        {"desired_policy", desired_policy_},
+        {"desired_mode", status.trajectory_enabled ? "TRAJECTORY" : "RL"},
+        {"switching", desired_trajectory_ || !desired_policy_.empty()},
+        {"interaction_phase", status.interaction_phase},
+        {"fault", status.fault.latched},
+        {"owns_control", status.owns_control}};
+    }
+    if (operation == "walk" || operation == "stand" ||
+      operation == "stop")
+    {
+      if (operation == "walk" && status.trajectory_enabled) {
+        return {{"ok", false},
+          {"error", "walking is unavailable in trajectory mode"}};
+      }
+      target_ = {};
+      command_until_ = Clock::time_point{};
+      desired_trajectory_ = status.trajectory_enabled;
+      desired_policy_ = desired_trajectory_ ? "" :
+        (operation == "walk" ? walk_policy_ : stand_policy_);
+      return {{"ok", true}, {"desired_policy", desired_policy_},
+        {"desired_mode", desired_trajectory_ ? "TRAJECTORY" : "RL"}};
+    }
+    if (operation == "velocity" || operation == "forward") {
+      if (!status.online || !status.owns_control || status.state != "RL" ||
+        status.policy != walk_policy_)
+      {
+        return {{"ok", false},
+          {"error", "walking policy/RL is not ready"}};
+      }
+      const double duration = request.value("duration_s", 10.0);
+      if (!std::isfinite(duration) || duration < 0.1 || duration > 30.0) {
+        return {{"ok", false},
+          {"error", "duration_s must be in [0.1, 30]"}};
+      }
+      const bool accepted = SetTarget(
+        request.value(
+          "vx",
+          operation == "forward" ? 0.2 : 0.0),
+        operation == "velocity" ? request.value("vy", 0.0) : 0.0,
+        operation == "velocity" ? request.value("wz", 0.0) : 0.0,
+        duration);
+      if (accepted) {
+        voice_override_until_ = command_until_;
+      }
+      return {{"ok", accepted}};
+    }
+    if (operation == "wave" || operation == "interaction") {
+      const std::string action = operation == "wave" ? "wave_hello" :
+        request.value("action", std::string{});
+      return ReplyJson(client_.StartInteraction(action));
+    }
+    if (operation == "cancel") {
+      return ReplyJson(client_.CancelInteraction());
+    }
+    return {{"ok", false}, {"error", "unknown op"}};
+  }
+
+  operator_service::Client client_;
+  std::unique_ptr<CommandSocket> command_socket_;
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;
+  rclcpp::TimerBase::SharedPtr timer_;
+  operator_service::Velocity target_;
+  std::string desired_policy_;
+  std::string walk_policy_;
+  std::string stand_policy_;
+  bool desired_trajectory_ = false;
+  double cmd_vel_timeout_s_ = 0.5;
+  double request_period_s_ = 0.5;
+  double bias_x_ = 0.0;
+  double bias_y_ = 0.0;
+  double bias_yaw_ = 0.0;
+  int velocity_ttl_ms_ = 300;
+  Clock::time_point command_until_{};
+  Clock::time_point voice_override_until_{};
+  Clock::time_point last_renew_{};
+  Clock::time_point last_request_{};
+  Clock::time_point last_velocity_send_{};
+};
+
+int main(int argc, char * argv[])
+{
+  rclcpp::init(argc, argv);
+  const auto arguments = rclcpp::remove_ros_arguments(argc, argv);
+  if (arguments.size() < 2 || arguments[1] == "-h" ||
+    arguments[1] == "--help")
+  {
+    std::fprintf(
+      arguments.size() < 2 ? stderr : stdout,
+      "Usage: %s CONFIG.yaml [--ros-args ...]\n", argv[0]);
     rclcpp::shutdown();
-    return 0;
+    return arguments.size() < 2 ? 1 : 0;
+  }
+  try {
+    rclcpp::spin(
+      std::make_shared<HumanoidCmdVelClient>(
+        humanoid_operator::ResolvePath(arguments[1])));
+  } catch (const std::exception & error) {
+    std::fprintf(stderr, "[humanoid_cmd_vel_hmi] %s\n", error.what());
+    rclcpp::shutdown();
+    return 1;
+  }
+  rclcpp::shutdown();
+  return 0;
 }
