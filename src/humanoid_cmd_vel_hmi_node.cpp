@@ -245,8 +245,12 @@ private:
         reply = client_.RequestState("HOME");
       } else if (status.state == "HOME") {
         reply = client_.RequestState("ZERO");
-      } else if (status.state == "ZERO" && status.zero_ready) {
-        reply = client_.RequestState("TRAJECTORY");
+      } else if (status.state == "ZERO") {
+        if (status.zero_ready) {
+          reply = client_.RequestState("TRAJECTORY");
+        } else {
+          requested = false;
+        }
       } else if (status.state == "TRAJECTORY") {
         desired_trajectory_ = false;
         requested = false;

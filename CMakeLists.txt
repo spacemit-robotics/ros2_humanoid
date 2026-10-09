@@ -130,7 +130,9 @@ install(TARGETS humanoid_nav_rl_bridge_node humanoid_cmd_vel_hmi_node
   humanoid_head_tf_node tf_to_odom_node
   DESTINATION lib/${PROJECT_NAME}
 )
-install(PROGRAMS scripts/asr_action_control.py
+install(PROGRAMS
+  scripts/asr_action_control.py
+  scripts/asr_action_control_websocket.py
   DESTINATION lib/${PROJECT_NAME}
 )
 install(FILES scripts/asr_backend.py
