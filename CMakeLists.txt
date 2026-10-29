@@ -51,6 +51,17 @@ endif()
 
 get_filename_component(HUMANOID_COMMON_LIB_DIR "${TRANSPORT_EXECUTOR_LIB}" DIRECTORY)
 
+add_executable(g1_cmd_vel_bridge_node src/g1_cmd_vel_bridge_node.cpp)
+target_compile_features(g1_cmd_vel_bridge_node PRIVATE cxx_std_17)
+target_include_directories(g1_cmd_vel_bridge_node PRIVATE ${HUMANOID_COMMON_INCLUDE_DIR})
+ament_target_dependencies(g1_cmd_vel_bridge_node geometry_msgs rclcpp std_msgs)
+target_link_libraries(g1_cmd_vel_bridge_node
+  ${OPERATOR_CLIENT_LIB} ${ROBOT_BASE_LIB} pthread)
+set_target_properties(g1_cmd_vel_bridge_node PROPERTIES
+  BUILD_RPATH "${HUMANOID_COMMON_LIB_DIR}"
+  INSTALL_RPATH "${HUMANOID_COMMON_LIB_DIR}"
+)
+
 add_executable(humanoid_nav_rl_bridge_node src/humanoid_nav_rl_bridge_node.cpp)
 target_include_directories(humanoid_nav_rl_bridge_node PRIVATE ${HUMANOID_COMMON_INCLUDE_DIR})
 ament_target_dependencies(humanoid_nav_rl_bridge_node
@@ -126,7 +137,7 @@ ament_target_dependencies(tf_to_odom_node
   tf2_ros
 )
 
-install(TARGETS humanoid_nav_rl_bridge_node humanoid_cmd_vel_hmi_node
+install(TARGETS g1_cmd_vel_bridge_node humanoid_nav_rl_bridge_node humanoid_cmd_vel_hmi_node
   humanoid_head_tf_node tf_to_odom_node
   DESTINATION lib/${PROJECT_NAME}
 )
@@ -152,6 +163,7 @@ install(FILES README.md
 )
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
   find_package(ament_lint_auto REQUIRED)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)

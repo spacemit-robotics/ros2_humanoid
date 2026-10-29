@@ -3,8 +3,10 @@
 ## 项目简介
 
 `humanoid` 是人形机器人 ROS2 控制集成包，用于把 ROS2 导航、终端控制和 TF
-接入现有 native 人形机器人运控链路。当前提供三个节点：
+接入现有 native 人形机器人运控链路。主要节点：
 
+- `g1_cmd_vel_bridge_node`：仅对接 G1 的 ROS2 `/cmd_vel`，在已有 RL 状态下
+  申请控制权并转发速度，不切换机器人状态或策略。
 - `humanoid_nav_rl_bridge_node`：通过 `hmi_runtime` 的 operator socket 服务将 Nav2
   `/cmd_vel` 接入 RL 运控链路，用于 MuJoCo 仿真和实机导航。
 - `humanoid_cmd_vel_hmi_node`：通过同一 operator socket 服务接收 ROS2 `/cmd_vel`，
@@ -23,12 +25,85 @@
 - 支持自动选择 RL 策略并请求 FSM 进入 RL 状态。
 - 支持速度限幅、加速度限制、指令超时清零和 RL 状态门控。
 - 支持通过状态话题观察控制连接、FSM、策略和速度门控状态。
-- 核心节点可复用于不同人形机器人，当前仅提供 LingLong 专用 launch 和参数。
+- 提供 G1 速度桥接和 LingLong 导航专用 launch、参数。
 - 本包不提供底层 driver、`control_runtime`、RL 策略模型或 Nav2。
 
 ## 快速开始
 
 以下流程在 `spacemit_robot` 根目录执行。
+
+### G1：仅桥接 cmd_vel
+
+先编译并加载 ROS2 环境（G1 target 需要启用 `middleware/ros2/control/humanoid`）：
+
+```bash
+source build/envsetup.sh
+lunch k3-com260-kit-humanoid-unitree-g1
+m -R
+source output/staging/setup.bash  # zsh 使用 setup.zsh
+```
+
+终端 1 启动仿真，用 TUI 选择行走策略并手动进入 `RL`，然后按 `U` 释放控制权，
+保留 TUI 和仿真进程：
+
+```bash
+run_g1.sh --sim
+```
+
+终端 2 加载同一环境并启动速度桥接：
+
+```bash
+source output/staging/setup.bash
+ros2 launch humanoid g1_cmd_vel_bridge.launch.py
+# 也可以直接运行：ros2 run humanoid g1_cmd_vel_bridge_node
+```
+
+终端 3 发送机器人坐标系中的纵向、横向和转向速度（单位 m/s、m/s、rad/s）：
+
+```bash
+source output/staging/setup.bash
+ros2 topic pub --rate 10 /cmd_vel geometry_msgs/msg/Twist \
+  '{linear: {x: 0.2, y: 0.0}, angular: {z: 0.0}}'
+```
+
+桥接节点只使用 `operator_client` 的连接、状态查询、控制权租约和速度接口，
+不选择策略、不请求状态切换、不确认故障、不触发交互动作，也不调用全局 `Stop()`。
+速度限幅由 operator 服务依据当前策略的速度范围执行。
+
+- 仅在反馈在线、HMI 已连接、状态为 `RL` 且没有故障时接收速度；其他状态收到的
+  命令直接丢弃，进入 RL 后必须重新发布。桥接不检查固定策略名称。
+- 收到新命令后才申请控制权；其他客户端持有控制权时丢弃命令，不抢占。
+  从 TUI 交接时先按 `U`。ROS 停止发速度后，默认 0.2 秒开始下发零速度，但继续
+  续租；距离最后一条有效 `cmd_vel` 达到 5 秒后才释放控制权，随后可在 TUI 按 `L`
+  重新接管。5 秒内收到新速度会直接恢复转发，并重新计算两个超时，无需重新申请控制权。
+  持续发布速度会持续申请／续租，交回 TUI 前先停掉发布者。
+- `cmd_vel_timeout_s` 控制清零超时，`control_release_timeout_s` 控制释放超时，
+  两者均从最后一条有效 `cmd_vel` 开始计时，释放超时必须大于清零超时。
+- launch 默认每秒发送 10 次，单次速度有效期 600 ms；非法数值、退出 RL、故障、
+  断线及发送失败都会清除缓存。退出节点时仅清零自身速度并释放自身控制权，
+  不请求关机或切换状态。断线后每秒重试连接，重连后等待新的 ROS 命令。
+- 订阅 `geometry_msgs/msg/Twist`，只取 `linear.x/y` 和 `angular.z`；QoS 为
+  best effort、volatile、深度 1，兼容可靠和 best effort 发布者。
+
+查看当前门控状态：
+
+```bash
+ros2 topic echo /g1_cmd_vel_bridge/status
+```
+
+全部参数及默认值定义在 [`launch/g1_cmd_vel_bridge.launch.py`](launch/g1_cmd_vel_bridge.launch.py)，
+可通过同名 launch 参数覆盖：`cmd_vel_topic`、`cmd_vel_timeout_s`、`control_release_timeout_s`、`publish_rate_hz`、
+`velocity_ttl_ms`、`socket_timeout_ms`、`connection_file`、`robot_config_path`，例如：
+
+```bash
+ros2 launch humanoid g1_cmd_vel_bridge.launch.py cmd_vel_topic:=/navigation/cmd_vel
+```
+
+默认读取 `$XDG_STATE_HOME/humanoid-operator/g1/connection.json`，未设置时使用
+`$HOME/.local/state/humanoid-operator/g1/connection.json`。如设置了 `G1_CONFIG` 或
+自定义 `operator_service.connection_file`，用 `robot_config_path:=/绝对路径/g1.yaml`
+或 `connection_file:=/绝对路径/connection.json` 指向相同配置；显式 connection 文件优先。
+节点和 `hmi_runtime` 应以同一用户运行，也可用于 `run_g1.sh --real` 启动的服务。
 
 ### 环境准备
 
