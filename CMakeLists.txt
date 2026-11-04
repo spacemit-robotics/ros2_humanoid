@@ -129,6 +129,22 @@ set_target_properties(humanoid_head_tf_node PROPERTIES
   INSTALL_RPATH "${HUMANOID_COMMON_LIB_DIR}"
 )
 
+add_executable(g1_body_tf_node src/g1_body_tf_node.cpp)
+target_compile_features(g1_body_tf_node PRIVATE cxx_std_17)
+target_include_directories(g1_body_tf_node PRIVATE
+  ${HUMANOID_COMMON_INCLUDE_DIR}
+  ${HUMANOID_TRANSPORT_PACKET_DIR}
+)
+set_property(SOURCE src/g1_body_tf_node.cpp APPEND PROPERTY
+  OBJECT_DEPENDS "${HUMANOID_TRANSPORT_PACKET_DIR}/transport_packet.h"
+)
+ament_target_dependencies(g1_body_tf_node geometry_msgs rclcpp tf2 tf2_ros)
+target_link_libraries(g1_body_tf_node ${ROBOT_BASE_LIB} pthread rt)
+set_target_properties(g1_body_tf_node PROPERTIES
+  BUILD_RPATH "${HUMANOID_COMMON_LIB_DIR}"
+  INSTALL_RPATH "${HUMANOID_COMMON_LIB_DIR}"
+)
+
 add_executable(tf_to_odom_node src/tf_to_odom_node.cpp)
 ament_target_dependencies(tf_to_odom_node
   nav_msgs
@@ -138,7 +154,7 @@ ament_target_dependencies(tf_to_odom_node
 )
 
 install(TARGETS g1_cmd_vel_bridge_node humanoid_nav_rl_bridge_node humanoid_cmd_vel_hmi_node
-  humanoid_head_tf_node tf_to_odom_node
+  humanoid_head_tf_node g1_body_tf_node tf_to_odom_node
   DESTINATION lib/${PROJECT_NAME}
 )
 install(PROGRAMS
@@ -158,12 +174,18 @@ install(DIRECTORY config launch
   PATTERN "__pycache__" EXCLUDE
   PATTERN "*.pyc" EXCLUDE
 )
-install(FILES README.md
+install(FILES README_linglong.md README_g1.md
   DESTINATION share/${PROJECT_NAME}
 )
 
 if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(g1_body_tf tests/test_g1_body_tf.py
+    TIMEOUT 40
+    ENV
+      "G1_BODY_TF_EXECUTABLE=$<TARGET_FILE:g1_body_tf_node>"
+      "G1_TF_MODEL=${CMAKE_CURRENT_SOURCE_DIR}/../../../../application/native/humanoid_unitree_g1/resources/urdf/g1_29dof_rev_1_0.urdf"
+  )
   find_package(ament_lint_auto REQUIRED)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)
