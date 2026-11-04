@@ -3,7 +3,8 @@
 ## 项目简介
 
 `humanoid` 将 ROS2 `/cmd_vel` 接入 G1 的 native 运控链路，并提供实机腰部、
-IMU 姿态动态 TF 和 D435i 安装 TF。LingLong 的导航桥接、语音动作和头部 TF 说明见
+IMU 姿态动态 TF、D435i 安装 TF，以及 RGBD 建图和导航启动配置。
+LingLong 的导航桥接、语音动作和头部 TF 说明见
 [README_linglong.md](README_linglong.md)。
 
 - `g1_cmd_vel_bridge_node`：通过公开的 `operator_client` 接口，在已有 RL 状态下
@@ -12,8 +13,13 @@ IMU 姿态动态 TF 和 D435i 安装 TF。LingLong 的导航桥接、语音动�
   不包含雷达；RealSense 驱动负责相机内部 TF。
 - `g1_body_tf_node` / `g1_body_tf.launch.py`：只读观察 native 状态 SHM，按腰部
   关节反馈和 pelvis IMU 姿态发布动态 TF，相机安装外参为静态 TF。
+- `g1_rgbd_slam.launch.py`：启动 RTAB-Map 建图／定位、深度点云及地面／障碍物分割。
+- `g1_rgbd_nav2.launch.py`：使用 `config/g1_rgbd_nav2_params.yaml` 启动 Nav2 导航节点。
 
-本包不提供底层 driver、`control_runtime`、RL 策略模型或 Nav2。
+底层 driver、`control_runtime` 和 RL 策略模型由 native 工程提供；RTAB-Map、Nav2
+及 RealSense 驱动需另行安装。本包的 RGBD launch 不启动相机、里程计或 native 运控进程。
+完整 MuJoCo RGBD 仿真流程见
+[humanoid_mujoco/README_g1.md](../../simulation/humanoid_mujoco/README_g1.md)。
 
 ## 快速开始：仅桥接 cmd_vel
 
@@ -58,8 +64,9 @@ ros2 topic pub --rate 10 /cmd_vel geometry_msgs/msg/Twist \
 不选择策略、不请求状态切换、不确认故障、不触发交互动作，也不调用全局 `Stop()`。
 速度限幅由 operator 服务依据当前策略的速度范围执行。
 
-- 仅在反馈在线、HMI 已连接、状态为 `RL` 且没有故障时接收速度；其他状态收到的
-  命令直接丢弃，进入 RL 后必须重新发布。桥接不检查固定策略名称。
+- 仅在反馈在线、HMI 已连接、状态为 `RL`、未启用轨迹播放且没有活动或锁存故障时
+  接收速度；其他状态收到的命令直接丢弃，进入 RL 后必须重新发布。
+  桥接不检查固定策略名称。
 - 收到新命令后才申请控制权；其他客户端持有控制权时丢弃命令，不抢占。
   从 TUI 交接时先按 `U`。ROS 停止发速度后，默认 0.2 秒开始下发零速度，但继续
   续租；距离最后一条有效 `cmd_vel` 达到 5 秒后才释放控制权，随后可在 TUI 按 `L`
@@ -70,6 +77,8 @@ ros2 topic pub --rate 10 /cmd_vel geometry_msgs/msg/Twist \
 - launch 默认每秒发送 10 次，单次速度有效期 600 ms；非法数值、退出 RL、故障、
   断线及发送失败都会清除缓存。退出节点时仅清零自身速度并释放自身控制权，
   不请求关机或切换状态。断线后每秒重试连接，重连后等待新的 ROS 命令。
+  直接 `ros2 run` 时，`velocity_ttl_ms` 和 `socket_timeout_ms` 的节点默认值均为
+  300 ms；launch 将这两项覆盖为 600 ms。
 - 订阅 `geometry_msgs/msg/Twist`，只取 `linear.x/y` 和 `angular.z`；QoS 为
   best effort、volatile、深度 1，兼容可靠和 best effort 发布者。
 
@@ -242,17 +251,137 @@ ros2 run tf2_ros tf2_echo camera_link camera_color_optical_frame
 默认零腰角下，`base_footprint -> camera_link` 的位置为
 `[0.05366, 0.01753, 1.26687] m`，俯仰为 `0.8307767239493009 rad`。
 
+## RGBD 建图与 Nav2 导航
+
+### 依赖与输入
+
+除前述 native underlay 与本包外，运行环境还需 `rtabmap_slam`、`rtabmap_util`、
+`nav2_bringup`、`nav2_navfn_planner` 和 `nav2_regulated_pure_pursuit_controller`；
+启用可视化时还需 `rtabmap_viz`。完整运行依赖见 [`package.xml`](package.xml)。
+
+启动前需由上游提供以下话题和 TF；实机默认使用系统时间 `use_sim_time:=false`：
+
+| 输入 | 要求 |
+| --- | --- |
+| `/camera/image_raw` | `sensor_msgs/msg/Image`，彩色图像 |
+| `/camera/depth/image_raw` | `sensor_msgs/msg/Image`，与彩色图像对齐的深度图 |
+| `/camera/camera_info` | `sensor_msgs/msg/CameraInfo`，对应对齐图像的内参 |
+| `/odom` | `nav_msgs/msg/Odometry`，连续的平面里程计 |
+| `odom -> base_footprint` | 外部里程计提供的动态 TF |
+| `base_footprint -> 相机 optical frame` | 本文机体／安装 TF 与相机驱动 TF 组成的完整链 |
+
+当前 `g1_rgbd_slam.launch.py` 固定使用这些话题名，且 RTAB-Map 设置
+`approx_sync=false`，要求输入 RGB、深度和 CameraInfo 时间戳匹配。RealSense
+驱动原始话题通常与这里不同；使用上一节的驱动命令时，应在上游将以下话题重映射或转发：
+
+| RealSense 话题（上一节默认命名） | 本方案输入 |
+| --- | --- |
+| `/camera/camera/color/image_raw` | `/camera/image_raw` |
+| `/camera/camera/aligned_depth_to_color/image_raw` | `/camera/depth/image_raw` |
+| `/camera/camera/color/camera_info` | `/camera/camera_info` |
+
+必须使用对齐到彩色的深度图和对应内参；仅修改话题名不能完成图像对齐或时间同步。
+当前 launch 未暴露话题名和同步方式参数；需要其他接口时，调整
+[`g1_rgbd_slam.launch.py`](launch/g1_rgbd_slam.launch.py) 中的 remappings 与 parameters。
+
+实机 `g1_body_tf_node` 只提供身体倾斜和腰部／相机链，**不提供 `/odom` 或
+`odom -> base_footprint`**。本节 launch 也不启动 `rgbd_odometry`；需先接入并验证
+外部视觉里程计或状态估计器。RTAB-Map 发布 `map -> odom`，不要同时让其他定位节点
+发布这条 TF。使用 MuJoCo RGBD DRIVER 时，里程计和机体／相机 TF 已由仿真提供，
+不要再启动实机 TF launch。
+
+### 分步启动
+
+以下命令在 `spacemit_robot` 根目录执行，各终端均需先加载
+`output/staging/setup.bash`。实机先启动 native 运控、相机、机体 TF 和外部里程计，
+确认上表输入就绪后，再分别启动：
+
+```bash
+# 终端 1：建图、点云和障碍物分割；按需启用 RTAB-Map 可视化
+ros2 launch humanoid g1_rgbd_slam.launch.py start_viz:=true \
+  database_path:=$HOME/.ros/g1_real_map.db
+
+# 终端 2：导航（不启动建图、定位、相机或速度桥）
+ros2 launch humanoid g1_rgbd_nav2.launch.py
+
+# 终端 3：速度桥；若前面的流程已启动该节点，不要重复启动
+ros2 launch humanoid g1_cmd_vel_bridge.launch.py
+```
+
+用 TUI 选择经验证的行走策略并手动进入 `RL`，按 `U` 释放控制权后，再通过 RViz
+的 `Nav2 Goal` 或 `NavigateToPose` action 发送目标。导航节点不会自动选择策略或
+切换 FSM。切回 TUI 前先取消导航目标并停止其他速度发布者，等待桥接释放控制权后按 `L`。
+
+启动后的数据链为：
+
+```text
+RGBD + /odom + TF -> RTAB-Map -> /map、map -> odom
+深度图 -> /camera/cloud -> /camera/ground、/camera/obstacles -> Nav2 costmap
+Nav2 -> velocity_smoother -> /cmd_vel -> g1_cmd_vel_bridge -> native operator 服务
+```
+
+这套配置使用深度点云，无需 `/scan`。SLAM launch 始终启动点云与分割节点，
+`start_viz` 仅控制 `rtabmap_viz`，不启动 RViz。Nav2 launch 仅包含
+`nav2_bringup/navigation_launch.py`，自动激活导航节点，不启动 AMCL 或 map server。
+
+### 参数、地图与定位
+
+| launch | 参数与默认值 |
+| --- | --- |
+| `g1_rgbd_slam.launch.py` | `use_sim_time:=false`、`localization:=false`、`start_viz:=false`、`database_path:=$HOME/.ros/g1_rgbd_textured_map.db` |
+| `g1_rgbd_nav2.launch.py` | `use_sim_time:=false`、`params:=<humanoid 安装目录>/config/g1_rgbd_nav2_params.yaml` |
+
+数据库默认路径在启动时展开为当前用户的绝对路径，不会自动删除已有数据库。
+新建地图时指定新的数据库路径；实机和仿真应分别保存。正常退出建图后，用同一数据库
+进入定位模式，再单独启动上述 Nav2 与速度桥：
+
+```bash
+ros2 launch humanoid g1_rgbd_slam.launch.py localization:=true \
+  database_path:=$HOME/.ros/g1_real_map.db
+```
+
+定位模式设置 `Mem/IncrementalMemory=false`、`Mem/InitWMWithAllNodes=true`。
+也可将当前 `/map` 导出为二维栅格，但栅格文件不能替代 RTAB-Map 的视觉定位数据库：
+
+```bash
+ros2 run nav2_map_server map_saver_cli -f "$HOME/g1_map" \
+  --ros-args -p use_sim_time:=false
+```
+
+仿真中使用本包的 SLAM／Nav2 launch 时，两者均传 `use_sim_time:=true`，并确保
+仿真发布 `/clock`。Nav2 launch 会用该参数覆盖 YAML 中的 `use_sim_time`。
+完整仿真也可直接按 `humanoid_mujoco` 的 README 启动，避免重复启动同一组节点。
+
+导航参数集中在 [`config/g1_rgbd_nav2_params.yaml`](config/g1_rgbd_nav2_params.yaml)。
+当前使用 NavFn 全局规划、Regulated Pure Pursuit 路径跟踪、点云 voxel costmap 和
+速度平滑；巡航速度为 `0.4 m/s`，接近目标时最低速度为 `0.35 m/s`，平滑器限制
+纵向速度至 `[-0.22, 0.4] m/s`、角速度至 `[-0.5, 0.5] rad/s`，不输出横向速度。
+这些参数针对 `walk_mnn` 的站立阈值设置，不能视为实机通用标定；更换策略或平台后，
+需重新验证速度范围、机体 footprint、障碍物高度与目标容差。自定义配置示例：
+
+```bash
+ros2 launch humanoid g1_rgbd_nav2.launch.py params:=/绝对路径/g1_nav2.yaml
+ros2 launch humanoid g1_rgbd_slam.launch.py --show-args
+ros2 launch humanoid g1_rgbd_nav2.launch.py --show-args
+```
+
 ## 常见问题
 
-- 状态显示 `control=offline`：确认 driver、`control_runtime` 和 `hmi_runtime`
-  已启动，且使用同一机器人配置。
+- 桥接状态显示 `online=false` 或连接失败：确认 driver、`control_runtime` 和
+  `hmi_runtime` 已启动，且使用同一机器人配置和 operator connection 文件。
 - 收到 `/cmd_vel` 但机器人不动：确认反馈在线、HMI 已连接、状态为 `RL` 且无故障，
-  并确认其他客户端未持有控制权。节点不会自动选择策略或切换 FSM；从 TUI 交接时
+  未启用轨迹播放，并确认其他客户端未持有控制权。节点不会自动选择策略或切换 FSM；从 TUI 交接时
   先按 `U`，进入 RL 后重新发布速度。
 - ROS 停止发速度后 TUI 暂时无法接管：默认 0.2 秒后清零速度，5 秒后释放控制权；
   释放后可在 TUI 按 `L` 接管，交接前先停止 ROS 速度发布者。
 - 相机 TF 不连通：确认 RealSense 的实际根 frame 与 `camera_frame` 一致，且驱动
   启用了 `publish_tf`。本 launch 不提供定位和里程计 TF。
+- RTAB-Map 没有地图或提示等待数据：检查 RGB、对齐深度、CameraInfo 的话题名与
+  时间戳，以及 `/odom`、`odom -> base_footprint` 和相机 TF 是否就绪；实机不要
+  启用 `use_sim_time`。默认使用精确同步，仅有话题但时间戳不匹配也无法建图。
+- Nav2 未输出速度或停滞：先检查 `/map`、定位 TF、`/camera/obstacles` 和导航节点
+  lifecycle 状态，再检查 `/cmd_vel` 与 `/g1_cmd_vel_bridge/status`。地图和路径正常
+  但机器人不动时，还需核对策略速度阈值及控制权；Nav2 不负责进入 RL。
 - 找不到 `robot_base` 或 `transport_executor`：先执行 `m -C` 构建 native underlay。
 
 ## 版本与发布
