@@ -354,10 +354,15 @@ ros2 run nav2_map_server map_saver_cli -f "$HOME/g1_map" \
 
 导航参数集中在 [`config/g1_rgbd_nav2_params.yaml`](config/g1_rgbd_nav2_params.yaml)。
 当前使用 NavFn 全局规划、Regulated Pure Pursuit 路径跟踪、点云 voxel costmap 和
-速度平滑；巡航速度为 `0.4 m/s`，接近目标时最低速度为 `0.35 m/s`，平滑器限制
-纵向速度至 `[-0.22, 0.4] m/s`、角速度至 `[-0.5, 0.5] rad/s`，不输出横向速度。
-这些参数针对 `walk_mnn` 的站立阈值设置，不能视为实机通用标定；更换策略或平台后，
-需重新验证速度范围、机体 footprint、障碍物高度与目标容差。自定义配置示例：
+速度平滑；限速参考 native `humanoid_unitree_g1/config/g1.yaml` 中三种常规运控
+（`stand`、`walk_mjlab`、`walk_rlgym`）的共同范围：纵向 `[-0.4, 0.7] m/s`、
+角速度 `[-1.0, 1.0] rad/s`。当前导航禁用倒退，平滑器纵向限速为 `[0.0, 0.7] m/s`，
+不输出横向速度。巡航速度为 `0.6 m/s`，接近目标及
+曲率／代价调速的最低速度为 `0.15 m/s`，为 MJLab 的 `0.1` 步态相位阈值留出余量。
+纵向／角向加速度为 `1.0 m/s²`／`2.0 rad/s²`，减速度幅值为 `2.5 m/s²`／
+`2.5 rad/s²`，与 native `operator_service.teleop` 配置一致。若使用限速更低的自定义
+机器人配置（如 `g1_rgbd.yaml`），需同步下调 Nav2 限速；更换策略或平台后，仍需验证
+速度范围、机体 footprint、障碍物高度与目标容差。自定义配置示例：
 
 ```bash
 ros2 launch humanoid g1_rgbd_nav2.launch.py params:=/绝对路径/g1_nav2.yaml
