@@ -1,3 +1,26 @@
+# Hiking 深度查看
+
+在 `spacemit_robot` 目录，先启动仿真，再在另一个终端运行查看器：
+
+```bash
+# 终端 1：仿真与控制
+output/staging/bin/run_g1.sh --sim --stairs
+
+# 终端 2：只读订阅深度，无需 ROS 环境
+python3 middleware/ros2/control/humanoid/scripts/view_hiking_depth.py
+```
+
+依赖为 `python3-zmq python3-numpy python3-opencv`，需要图形桌面。
+默认显示原始深度和 Hiking 预处理后的裁剪区域，白框表示原图中的裁剪范围。
+红色近、蓝色远，原始无效深度为黑色；模型输入中的无效值按策略规则填为 2.5 m。
+使用 `--raw-only` 只看原图，`--fps 5` 降低刷新率，`--max-depth 5` 调整色标上限。
+`--endpoint tcp://发布机地址:5560` 可连接已开放网络监听的发布器。
+
+查看器使用独立 ZMQ SUB，只保留最新帧，默认最多刷新 10 FPS；退出窗口不影响控制。
+`source Hz` 根据帧序号和采集时间估算；`Last received` 表示本机距离上次接收的时长，
+不代表采集到显示的端到端延迟。超过 0.2 s 未收到新帧显示 `STALE`。
+按 `Q`、`Esc`、`Ctrl-C` 或关闭窗口退出。
+
 # ASR 使用
 
 ```bash
