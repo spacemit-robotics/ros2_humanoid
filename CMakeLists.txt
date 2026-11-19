@@ -177,6 +177,9 @@ install(DIRECTORY config launch
 install(FILES README_linglong.md README_g1.md
   DESTINATION share/${PROJECT_NAME}
 )
+install(FILES scripts/README.md scripts/README_g1.md scripts/README_linglong.md scripts/ZMQ_ACTIONS.md
+  DESTINATION share/${PROJECT_NAME}/scripts
+)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)

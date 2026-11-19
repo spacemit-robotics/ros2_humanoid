@@ -6,6 +6,7 @@
 IMU 姿态动态 TF、D435i 安装 TF，以及 RGBD 建图和导航启动配置。
 LingLong 的导航桥接、语音动作和头部 TF 说明见
 [README_linglong.md](README_linglong.md)。
+Hiking 深度、RealSense 桥接及时间同步脚本见 [G1 脚本说明](scripts/README_g1.md)。
 
 - `g1_cmd_vel_bridge_node`：通过公开的 `operator_client` 接口，在已有 RL 状态下
   申请控制权并转发速度，不切换机器人状态或策略。

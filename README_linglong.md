@@ -182,7 +182,8 @@ print(socket.recv_json())
 ```
 
 站立策略的语音动作控制脚本见 [`scripts/asr_action_control.py`](scripts/asr_action_control.py)，
-录音依赖、启动方法和文本试运行方式见 [`scripts/README.md`](scripts/README.md)。
+启动方法和文本试运行方式见 [LingLong 脚本说明](scripts/README_linglong.md)，
+录音依赖与共享 ASR 后端配置见 [通用脚本说明](scripts/README.md)。
 
 不要同时启动该节点和 `run_hmi_linglong.sh`，因为二者都是 HMI transport 端。
 

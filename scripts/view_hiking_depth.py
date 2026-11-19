@@ -53,10 +53,31 @@ def decode_packet(packet):
     return header, depth
 
 
+def fill_depth_holes(depth):
+    """Use nearest original valid donors within radius 2; never propagate fills."""
+    raw = np.asarray(depth, dtype=np.float32)
+    if raw.shape != (36, 64):
+        raise ValueError("Hiking optical-Z depth must be 36x64")
+    valid = np.isfinite(raw) & (raw > 0)
+    filled = np.where(valid, raw, np.float32(2.5))
+    missing = ~valid
+    offsets = sorted((dy * dy + dx * dx, dy, dx)
+                     for dy in range(-2, 3) for dx in range(-2, 3)
+                     if 0 < dy * dy + dx * dx <= 4)
+    for _, dy, dx in offsets:
+        y0, y1 = max(0, -dy), min(36, 36 - dy)
+        x0, x1 = max(0, -dx), min(64, 64 - dx)
+        target = np.s_[y0:y1, x0:x1]
+        source = np.s_[y0 + dy:y1 + dy, x0 + dx:x1 + dx]
+        take = missing[target] & valid[source]
+        filled[target][take] = raw[source][take]
+        missing[target][take] = False
+    return filled
+
+
 def model_depth(depth):
     """Match Hiking's single-frame preprocessing, returning clipped meters."""
-    crop = depth[18:36, 16:48]
-    crop = np.where(np.isfinite(crop) & (crop > 0), crop, np.float32(2.5))
+    crop = fill_depth_holes(depth)[18:36, 16:48]
     weight = math.exp(-0.5)
     kernel = np.array([weight, 1, weight], dtype=np.float32) / (1 + 2 * weight)
     blurred = cv2.sepFilter2D(crop, -1, kernel, kernel, borderType=cv2.BORDER_REFLECT_101)
@@ -82,7 +103,7 @@ def render_frame(depth, maximum, raw_only):
     if not raw_only:
         panels.append(cv2.resize(colorize(model_depth(depth), maximum), (512, 288),
                                  interpolation=cv2.INTER_NEAREST))
-        labels.append("Model 32x18 | filtered, clipped at 2.5 m")
+        labels.append("Model 32x18 | hole-filled, filtered, <=2.5 m")
     canvas = np.full((408, len(panels) * 512, 3), 24, dtype=np.uint8)
     for index, (panel, label) in enumerate(zip(panels, labels)):
         x = index * 512
