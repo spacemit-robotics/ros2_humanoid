@@ -53,35 +53,15 @@ def decode_packet(packet):
     return header, depth
 
 
-def fill_depth_holes(depth):
-    """Use nearest original valid donors within radius 2; never propagate fills."""
+def model_depth(depth):
+    """Hiking's bottom-center crop, inpaint and blur, displayed in meters."""
     raw = np.asarray(depth, dtype=np.float32)
     if raw.shape != (36, 64):
         raise ValueError("Hiking optical-Z depth must be 36x64")
-    valid = np.isfinite(raw) & (raw > 0)
-    filled = np.where(valid, raw, np.float32(2.5))
-    missing = ~valid
-    offsets = sorted((dy * dy + dx * dx, dy, dx)
-                     for dy in range(-2, 3) for dx in range(-2, 3)
-                     if 0 < dy * dy + dx * dx <= 4)
-    for _, dy, dx in offsets:
-        y0, y1 = max(0, -dy), min(36, 36 - dy)
-        x0, x1 = max(0, -dx), min(64, 64 - dx)
-        target = np.s_[y0:y1, x0:x1]
-        source = np.s_[y0 + dy:y1 + dy, x0 + dx:x1 + dx]
-        take = missing[target] & valid[source]
-        filled[target][take] = raw[source][take]
-        missing[target][take] = False
-    return filled
-
-
-def model_depth(depth):
-    """Match Hiking's single-frame preprocessing, returning clipped meters."""
-    crop = fill_depth_holes(depth)[18:36, 16:48]
-    weight = math.exp(-0.5)
-    kernel = np.array([weight, 1, weight], dtype=np.float32) / (1 + 2 * weight)
-    blurred = cv2.sepFilter2D(crop, -1, kernel, kernel, borderType=cv2.BORDER_REFLECT_101)
-    return np.clip(blurred, 0, 2.5)
+    crop = raw[18:36, 16:48].copy()
+    crop[~np.isfinite(crop)] = 0
+    repaired = cv2.inpaint(crop, (crop < 0.2).astype(np.uint8), 3, cv2.INPAINT_NS)
+    return np.clip(cv2.GaussianBlur(repaired, (3, 3), 1.0), 0, 2.5)
 
 
 def colorize(depth, maximum):
@@ -194,6 +174,8 @@ def main():
     parser.add_argument("--max-depth", type=float, default=2.5, help="Color range in meters (default: 2.5)")
     parser.add_argument("--raw-only", action="store_true", help="Show only the raw depth panel")
     args = parser.parse_args()
+    if not args.raw_only and tuple(int(v) for v in cv2.__version__.split(".")[:2]) < (4, 10):
+        parser.error("model depth needs OpenCV >= 4.10 for border inpainting; use --raw-only for raw depth")
     if not math.isfinite(args.fps) or not 0 < args.fps <= 60:
         parser.error("--fps must be in (0, 60]")
     if not math.isfinite(args.max_depth) or args.max_depth <= 0:
