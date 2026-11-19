@@ -31,15 +31,22 @@ def decode_packet(packet):
     if size > 4096 or len(packet) != 4 + size + WIDTH * HEIGHT * 4:
         raise ValueError("depth packet length mismatch")
     header = json.loads(packet[4:4 + size])
-    expected = {"version": 1, "profile": "g1-sdk-hiking-v1", "width": WIDTH,
+    expected = {"version": 1, "width": WIDTH,
                 "height": HEIGHT, "dtype": "float32le", "unit": "m", "distance": "optical_z",
-                "frame": "torso_link/rgbd_camera"}
+                }
     if not isinstance(header, dict) or any(header.get(key) != value for key, value in expected.items()):
         raise ValueError("unsupported depth profile")
+    if header.get("profile") == "g1-realsense-preview-v1":
+        if header.get("clock") != "ros" or header.get("control_ready") is not False:
+            raise ValueError("preview must retain ROS time and control_ready=false")
+    elif header.get("profile") != "g1-sdk-hiking-v1" or header.get("frame") != "torso_link/rgbd_camera":
+        raise ValueError("unsupported depth profile/frame")
+    elif header.get("clock") not in ("sim", "robot"):
+        raise ValueError("native Hiking profile requires sim or robot time")
     stamp, sequence = header.get("time"), header.get("sequence")
     if (not isinstance(stamp, (int, float)) or not math.isfinite(stamp) or stamp < 0
             or not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0
-            or header.get("clock") not in ("sim", "robot")
+            or header.get("clock") not in ("sim", "robot", "ros")
             or not isinstance(header.get("session"), str) or not header["session"]):
         raise ValueError("invalid depth timestamp, sequence or session")
     depth = np.frombuffer(packet, dtype="<f4", offset=4 + size).reshape(HEIGHT, WIDTH)
@@ -137,7 +144,11 @@ def view(args):
                     state = "STALE" if age > 0.2 else "LIVE"
                     line = (f"{state} | seq {last_header['sequence']} | {last_header['clock']} "
                             f"t={last_header['time']:.3f}s | source ~{source_hz:.1f} Hz")
-                    detail = f"Last received {age:.2f}s ago | display <= {args.fps:g} FPS"
+                    if last_header.get("control_ready") is False:
+                        detail = (f"PREVIEW ONLY | ROS clock (not robot time) | "
+                                  f"coverage {last_header.get('coverage', 0):.0%}")
+                    else:
+                        detail = f"Last received {age:.2f}s ago | display <= {args.fps:g} FPS"
                 cv2.putText(shown, line, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 220, 255), 1)
                 cv2.putText(shown, detail, (10, 47), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
                 cv2.imshow(WINDOW, shown)

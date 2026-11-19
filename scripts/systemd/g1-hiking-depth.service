@@ -1,0 +1,25 @@
+[Unit]
+Description=G1 Hiking ROS depth to ZMQ with robot clock mapping
+Wants=network-online.target g1-realsense.service
+After=network-online.target g1-realsense.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=bianbu
+Group=bianbu
+Environment=ROS_DOMAIN_ID=73
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/home/bianbu/spacemit_robot
+RuntimeDirectory=g1-hiking-depth
+RuntimeDirectoryMode=0700
+UMask=0077
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec /usr/bin/python3 /home/bianbu/spacemit_robot/middleware/ros2/control/humanoid/scripts/realsense_depth_zmq.py --mode control --clock-endpoint tcp://192.168.60.153:5561 --time-map /run/g1-hiking-depth/clock_map.json'
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+KillMode=control-group
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

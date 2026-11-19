@@ -1,0 +1,22 @@
+[Unit]
+Description=G1 RealSense RGB, depth and IMU (640x360 at 30 FPS)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=bianbu
+Group=bianbu
+Environment=ROS_DOMAIN_ID=73
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/home/bianbu/spacemit_robot
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec ros2 launch realsense2_camera rs_launch.py camera_namespace:=/ enable_color:=true enable_depth:=true rgb_camera.color_profile:=640,360,30 depth_module.depth_profile:=640,360,30 align_depth.enable:=true enable_sync:=true enable_gyro:=true enable_accel:=true unite_imu_method:=2'
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+KillMode=control-group
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
