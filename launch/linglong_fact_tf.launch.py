@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -18,7 +16,7 @@ def generate_launch_description():
                    'base_footprint', 'base_link'],
     )
 
-    # hesai是Y轴向前，X轴向左，Z轴向上的坐标系，而ROS通常使用X轴向前，Y轴向左，Z轴向上的坐标系，因此需要进行坐标变换调整。这里的旋转角度 -1.57079632679（-90度）将 hesai_lidar 的坐标系从 ROS 标准坐标系旋转到正确的方向，使得激光雷达的数据能够正确地与 ROS 中的其他传感器数据进行融合和处理。
+    # Hesai 的 Y 轴向前，ROS 的 X 轴向前；绕 Z 轴旋转 -90° 对齐雷达坐标系。
     tf2_node_3d_laser = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
