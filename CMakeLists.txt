@@ -131,15 +131,9 @@ set_target_properties(humanoid_head_tf_node PROPERTIES
 
 add_executable(g1_body_tf_node src/g1_body_tf_node.cpp)
 target_compile_features(g1_body_tf_node PRIVATE cxx_std_17)
-target_include_directories(g1_body_tf_node PRIVATE
-  ${HUMANOID_COMMON_INCLUDE_DIR}
-  ${HUMANOID_TRANSPORT_PACKET_DIR}
-)
-set_property(SOURCE src/g1_body_tf_node.cpp APPEND PROPERTY
-  OBJECT_DEPENDS "${HUMANOID_TRANSPORT_PACKET_DIR}/transport_packet.h"
-)
+target_include_directories(g1_body_tf_node PRIVATE ${HUMANOID_COMMON_INCLUDE_DIR})
 ament_target_dependencies(g1_body_tf_node geometry_msgs rclcpp tf2 tf2_ros)
-target_link_libraries(g1_body_tf_node ${ROBOT_BASE_LIB} pthread rt)
+target_link_libraries(g1_body_tf_node ${OPERATOR_CLIENT_LIB} pthread)
 set_target_properties(g1_body_tf_node PROPERTIES
   BUILD_RPATH "${HUMANOID_COMMON_LIB_DIR}"
   INSTALL_RPATH "${HUMANOID_COMMON_LIB_DIR}"

@@ -12,7 +12,7 @@ Hiking 深度、RealSense 桥接及时间同步脚本见 [G1 脚本说明](scrip
   申请控制权并转发速度，不切换机器人状态或策略。
 - `g1_fact_tf.launch.py`：按 G1 `rev_1_0` 模型发布固定机体姿态和 D435i 安装 TF，
   不包含雷达；RealSense 驱动负责相机内部 TF。
-- `g1_body_tf_node` / `g1_body_tf.launch.py`：只读观察 native 状态 SHM，按腰部
+- `g1_body_tf_node` / `g1_body_tf.launch.py`：只读订阅远程 operator 反馈，按腰部
   关节反馈和 pelvis IMU 姿态发布动态 TF，相机安装外参为静态 TF。
 - `g1_rgbd_slam.launch.py`：启动 RTAB-Map 建图／定位、深度点云及地面／障碍物分割。
 - `g1_rgbd_nav2.launch.py`：使用 `config/g1_rgbd_nav2_params.yaml` 启动 Nav2 导航节点。
@@ -105,10 +105,66 @@ ros2 launch humanoid g1_cmd_vel_bridge.launch.py cmd_vel_topic:=/navigation/cmd_
 
 ## G1 实机：腰部与 IMU 动态 TF
 
-`g1_body_tf_node` 使用 `humanoid_common` 的 `RobotStatePacket` 协议，旁路只读
-映射 `/hmrs_<transport.shm.prefix>_state`（默认 `/hmrs_g1_state`）。它不修改
-共享内存读指针、不调用 transport 的消费者接口，不发送控制命令；可与
-`control_runtime` 同时运行。节点仅支持同机 `transport.type: shm`。
+`g1_body_tf_node` 通过 operator WebSocket 接口订阅关节角和基座 IMU，在大脑
+计算并发布 TF。小脑只运行 native driver、control 和 `hmi_runtime`，不需要
+运行 ROS 2。节点仅订阅测量数据，不申请控制权，不发送控制命令，可与导航速度桥
+及其他 operator 客户端共用服务。
+
+### 大小脑跨机部署
+
+小脑保留 `transport.type: shm`，driver、control 和 HMI 仍在本机通信。
+让现有的 operator 服务监听大脑可访问的地址，例如在原有实机启动命令中增加：
+
+```bash
+run_g1.sh --real --listen 0.0.0.0
+```
+
+也可配置小脑 `g1.yaml` 中的 `operator_service.bind_address: "0.0.0.0"`，端口默认
+`8766`。已有服务时修改配置后按现有流程重启，无需再启动第二个 HMI 服务。
+
+在大脑准备连接文件，例如 `/home/robot/g1-connection.json`：
+
+```json
+{
+  "endpoint": "ws://<小脑IP>:8766",
+  "token": "<小脑operator服务的有效token>"
+}
+```
+
+可以取小脑服务生成的 `connection.json`，在大脑的副本中将 `endpoint` 的本机地址
+改成小脑实际 IP。token 是连接凭据，文件应只允许运行节点的用户读取。
+
+在大脑加载 ROS 2 和本包环境后启动：
+
+```bash
+ros2 launch humanoid g1_body_tf.launch.py \
+  connection_file:=/home/robot/g1-connection.json \
+  base_height:=0.793
+```
+
+节点按远程反馈的 `joint_names` 查找腰部三个关节，无需在大脑安装小脑的机器人
+YAML。也可直接运行：
+
+```bash
+ros2 run humanoid g1_body_tf_node --ros-args \
+  -p connection_file:=/home/robot/g1-connection.json
+```
+
+未提供 `connection_file` 时，默认读取 `$XDG_STATE_HOME/humanoid-operator/g1/connection.json`；
+未设置 `XDG_STATE_HOME` 时读取 `$HOME/.local/state/humanoid-operator/g1/connection.json`。
+文件中的 `endpoint` 仍须指向小脑服务。
+
+TF 使用大脑处理这帧反馈时的本机 ROS 系统时间（`use_sim_time=false`），不将设备
+运行时间或小脑接收时间转换为 TF 时间戳。两板系统时钟已同步的部署不需要额外时钟映射。
+只处理 `available`、`fresh` 均为真、反馈年龄不超过 `state_timeout_s` 的新样本；
+按 `stream_id` / `sequence` 去重，断线后自动重连并重新订阅。过期、缺少必需关节
+或 IMU 的反馈不会产生新的动态 TF；关闭 footprint TF 时只需要腰部关节反馈。
+
+反馈采样率由小脑 `hmi.status_hz` 控制，当前 G1 配置默认 `20 Hz`。
+`publish_rate_hz` 是大脑读取最新样本的频率上限，不会重复给旧反馈刷新时间戳；
+需要更高测量频率时，可相应提高小脑 `hmi.status_hz`。
+
+### TF 链
 
 默认发布以下链路，不含雷达和四肢 TF：
 
@@ -124,32 +180,13 @@ base_footprint
                             └── 相机 stream / optical / IMU frame（RealSense 驱动发布）
 ```
 
-节点从实际运行的 `g1.yaml` 中按关节名查找腰部角度，使用经过驱动极性、零偏和
+节点从远程反馈中按关节名查找腰部角度，使用经过驱动极性、零偏和
 机构映射后的反馈，不固定假设数组下标。关节原点与下节静态方案一样，采用
 `g1_29dof_rev_1_0.urdf`；腰部链按 yaw → roll → pitch 逐级计算，包含 roll
 关节的 `[-0.0039635, 0, 0.044] m` 原点偏移。
 
-先启动原生实机 driver，再单独启动 TF；已有 driver 时直接运行第二条命令。
+先在小脑启动 native driver、control 和 operator 服务，再在大脑启动 TF。
 TF 节点本身不启动 driver、control 或 HMI，不申请控制权。
-
-```bash
-# 终端 1：按现有实机流程启动 driver
-run_driver_g1.sh --real
-
-# 终端 2：编译并加载环境后运行，配置须与 driver 一致
-source output/staging/setup.bash
-ros2 launch humanoid g1_body_tf.launch.py \
-  robot_config_path:=$PWD/application/native/humanoid_unitree_g1/config/g1.yaml \
-  base_height:=0.793
-```
-
-也可以直接启动节点：
-
-```bash
-ros2 run humanoid g1_body_tf_node \
-  "$PWD/application/native/humanoid_unitree_g1/config/g1.yaml" \
-  --ros-args -p base_height:=0.793 -p publish_rate_hz:=50.0
-```
 
 相机驱动的启动方法见下一节。动态方案与 `g1_fact_tf.launch.py` 二选一，且不要
 同时运行其他发布同一机体链的 `robot_state_publisher` 或仿真驱动。
@@ -165,17 +202,15 @@ ros2 run humanoid g1_body_tf_node \
 - `base_height` 仍为配置常量，默认 `0.793 m` 取自模型初始高度。应按站姿实测；
   节点不能测出下蹲、腾空等高度变化。若状态估计器已提供完整基座 TF，使用
   `publish_footprint_tf:=false`，节点只提供 pelvis 与腰部／相机链。
-- 节点默认以最多 `50 Hz` 读取最新状态，仅在包序号和设备时间推进且数据合法、
-  无活动故障时发布动态 TF。启动先建立设备时间基线，等后续反馈再发布，避免
-  使用遗留 SHM 数据。设备时间停止推进或缺少有效反馈超过 `state_timeout_s`
-  （默认 `0.1 s`）时重连 SHM，反馈恢复后继续；不会持续给旧姿态打新时间戳。
-- HI91 的 `packet.time` 是设备运行时间，不是 ROS 时间。TF 使用收到反馈时的
-  ROS 系统时间，要求 `use_sim_time=false`；这是接收时间近似，不是相机与 IMU
-  的硬件同步。RealSense 与 TF 节点应使用一致的主机时钟。
+- 节点默认以最多 `50 Hz` 读取最新反馈，仅对合法、未过期且序号推进的测量发布
+  动态 TF。反馈中断或超过 `state_timeout_s`（默认 `0.1 s`）后暂停动态 TF，
+  反馈恢复后继续，不会持续给旧姿态打新时间戳。
+- TF 使用大脑本机 ROS 系统时间，要求 `use_sim_time=false`；这是接收时间近似。
+  RealSense 与 TF 节点使用大脑本机系统时钟。
 
 ### 参数与检查
 
-launch 支持 `robot_config_path`、`sdk_root`、`publish_rate_hz`、`state_timeout_s`、
+launch 支持 `connection_file`、`socket_timeout_ms`、`publish_rate_hz`、`state_timeout_s`、
 `base_height`、`publish_footprint_tf`、`footprint_frame`、`base_frame`、`camera_frame`
 以及 `camera_x/y/z`、`camera_roll/pitch/yaw`。坐标系名称应互不相同；`base_frame`
 默认 `base_link`，节点另行发布它与模型 `pelvis` 的单位变换。

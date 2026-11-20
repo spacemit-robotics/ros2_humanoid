@@ -3,13 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * @file g1_body_tf_node.cpp
- * @brief Read-only G1 waist/IMU TF from native hardware state SHM.
+ * @brief Read-only G1 waist/IMU TF from remote operator feedback.
  */
-
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -17,115 +12,22 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <memory>
 #include <set>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "geometry_msgs/msg/transform_stamped.hpp"
+#include "operator_client.h"
+#include "operator_client_utils.hpp"
 #include "rclcpp/rclcpp.hpp"
-#include "robot_base.h"
 #include "tf2/LinearMath/Quaternion.h"
 #include "tf2_ros/static_transform_broadcaster.h"
 #include "tf2_ros/transform_broadcaster.h"
-#include "transport_packet.h"
 
 namespace
 {
-
-// Matches humanoid_common/src/transport/shm/shm_transport.cpp. This observer
-// must never call Shm::Read(): its read_index belongs to control_runtime.
-class StateShmTap
-{
-public:
-    explicit StateShmTap(std::string name) : name_(std::move(name)) {}
-    ~StateShmTap() { Close(); }
-    StateShmTap(const StateShmTap&) = delete;
-    StateShmTap& operator=(const StateShmTap&) = delete;
-
-    void Close()
-    {
-        if (mapping_) munmap(mapping_, size_);
-        if (fd_ >= 0) close(fd_);
-        mapping_ = nullptr;
-        fd_ = -1;
-        have_sequence_ = false;
-    }
-
-    bool ReadLatest(transport::RobotStatePacket* packet)
-    {
-        if (!mapping_ && !Open()) return false;
-        for (int attempt = 0; attempt < 3; ++attempt)
-        {
-            const auto capacity = Word(2);
-            const auto slot_size = Word(3);
-            const auto write_index = Word(0);
-            if (capacity < 2 || slot_size < sizeof(*packet) || write_index >= capacity ||
-                capacity > (size_ - kHeaderSize) / slot_size)
-            {
-                return false;
-            }
-            const auto latest = write_index == 0 ? capacity - 1 : write_index - 1;
-            const auto* slot = static_cast<const uint8_t*>(mapping_) + kHeaderSize +
-                static_cast<std::size_t>(latest) * slot_size;
-            transport::RobotStatePacket candidate{};
-            std::memcpy(&candidate, slot, sizeof(candidate));
-            __atomic_thread_fence(__ATOMIC_ACQUIRE);
-            transport::RobotStatePacket confirm{};
-            std::memcpy(&confirm, slot, sizeof(confirm));
-            __atomic_thread_fence(__ATOMIC_ACQUIRE);
-            // A ring wrap can restore write_index while a preempted copy is in
-            // progress. Compare the whole sample, not just its sequence header.
-            if (Word(0) != write_index || std::memcmp(&confirm, &candidate, sizeof(confirm)) != 0)
-                continue;
-            if (!transport::ValidRobotStatePacket(candidate)) return false;
-            if (have_sequence_ && candidate.header.seq == last_sequence_) return false;
-            have_sequence_ = true;
-            last_sequence_ = candidate.header.seq;
-            *packet = candidate;
-            return true;
-        }
-        return false;
-    }
-
-private:
-    bool Open()
-    {
-        fd_ = shm_open(name_.c_str(), O_RDONLY, 0);
-        if (fd_ < 0) return false;
-        struct stat status {};
-        if (fstat(fd_, &status) != 0 || status.st_size < static_cast<off_t>(kHeaderSize))
-        {
-            Close();
-            return false;
-        }
-        size_ = static_cast<std::size_t>(status.st_size);
-        mapping_ = mmap(nullptr, size_, PROT_READ, MAP_SHARED, fd_, 0);
-        if (mapping_ == MAP_FAILED)
-        {
-            mapping_ = nullptr;
-            Close();
-            return false;
-        }
-        return true;
-    }
-
-    uint32_t Word(std::size_t index) const
-    {
-        return __atomic_load_n(static_cast<const uint32_t*>(mapping_) + index, __ATOMIC_ACQUIRE);
-    }
-
-    static constexpr std::size_t kHeaderSize = 64;
-    std::string name_;
-    int fd_ = -1;
-    void* mapping_ = nullptr;
-    std::size_t size_ = 0;
-    bool have_sequence_ = false;
-    uint32_t last_sequence_ = 0;
-};
 
 tf2::Quaternion Rpy(double roll, double pitch, double yaw)
 {
@@ -157,31 +59,17 @@ geometry_msgs::msg::TransformStamped Transform(
 class G1BodyTfNode final : public rclcpp::Node
 {
 public:
-    explicit G1BodyTfNode(const std::string& config_path) : Node("g1_body_tf")
+    G1BodyTfNode() : Node("g1_body_tf")
     {
-        const auto yaml = robot_base::YamlFile::Load(config_path);
-        if (yaml.Read<std::string>("transport.type").value_or("shm") != "shm")
-            throw std::runtime_error("g1_body_tf_node requires transport.type=shm");
         if (get_parameter("use_sim_time").as_bool())
-            throw std::runtime_error("g1_body_tf_node uses hardware receipt time; use_sim_time must be false");
-        const auto names = yaml.Read<std::vector<std::string>>("robot_base.joint_names")
-            .value_or(std::vector<std::string>{});
-        num_dof_ = names.size();
-        if (names.empty() || names.size() > transport::kMaxDof ||
-            std::set<std::string>(names.begin(), names.end()).size() != names.size())
-            throw std::runtime_error("robot_base.joint_names must contain 1..64 unique names");
-        const std::array<std::string, 3> waist_names = {
-            "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"};
-        for (std::size_t i = 0; i < waist_names.size(); ++i)
-        {
-            const auto found = std::find(names.begin(), names.end(), waist_names[i]);
-            if (found == names.end()) throw std::runtime_error("missing joint: " + waist_names[i]);
-            waist_indices_[i] = static_cast<std::size_t>(std::distance(names.begin(), found));
-        }
-        const auto prefix = yaml.Read<std::string>("transport.shm.prefix").value_or("g1");
-        if (prefix.empty() || prefix.find('/') != std::string::npos)
-            throw std::runtime_error("transport.shm.prefix must be nonempty and contain no slash");
-        state_tap_ = std::make_unique<StateShmTap>("/hmrs_" + prefix + "_state");
+            throw std::runtime_error("g1_body_tf_node uses local receipt time; use_sim_time must be false");
+        const auto connection = declare_parameter<std::string>("connection_file", "");
+        connection_file_ = connection.empty() ? humanoid_operator::DefaultConnectionFile("g1") :
+            humanoid_operator::ResolvePath(connection);
+        const auto socket_timeout = declare_parameter<int64_t>("socket_timeout_ms", 600);
+        if (socket_timeout < 100 || socket_timeout > 10000)
+            throw std::runtime_error("socket_timeout_ms must be in [100, 10000]");
+        socket_timeout_ms_ = static_cast<int>(socket_timeout);
 
         base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
         footprint_frame_ = declare_parameter<std::string>("footprint_frame", "base_footprint");
@@ -221,8 +109,8 @@ public:
         last_progress_ = std::chrono::steady_clock::now();
         timer_ = create_wall_timer(std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::duration<double>(1.0 / rate)), [this]() { Tick(); });
-        RCLCPP_INFO(get_logger(), "Read-only G1 TF: /hmrs_%s_state; pelvis height=%.3f m (configured)",
-            prefix.c_str(), base_height_);
+        RCLCPP_INFO(get_logger(), "Read-only G1 TF: operator connection=%s; pelvis height=%.3f m (configured)",
+            connection_file_.c_str(), base_height_);
     }
 
 private:
@@ -240,43 +128,85 @@ private:
         return value;
     }
 
-    void Tick()
+    static bool FindWaist(const std::vector<std::string>& names, std::array<std::size_t, 3>* indices)
+    {
+        if (names.empty() ||
+            std::set<std::string>(names.begin(), names.end()).size() != names.size() ||
+            std::any_of(names.begin(), names.end(), [](const auto& name) { return name.empty(); }))
+            return false;
+        const std::array<std::string, 3> waist_names = {
+            "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"};
+        for (std::size_t i = 0; i < waist_names.size(); ++i)
+        {
+            const auto found = std::find(names.begin(), names.end(), waist_names[i]);
+            if (found == names.end()) return false;
+            (*indices)[i] = static_cast<std::size_t>(std::distance(names.begin(), found));
+        }
+        return true;
+    }
+
+    void PollFeedback()
     {
         const auto steady_now = std::chrono::steady_clock::now();
-        if (std::chrono::duration<double>(steady_now - last_progress_).count() > state_timeout_)
+        if (!client_.Connected())
         {
-            // Also reconnect if driver_runtime unlinks and recreates the SHM object.
-            state_tap_->Close();
-            have_device_time_ = false;
-            last_progress_ = steady_now;
-            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                "Waiting for valid, advancing G1 state; dynamic TF is paused");
-        }
-        transport::RobotStatePacket packet{};
-        if (!state_tap_->ReadLatest(&packet)) return;
-        if (packet.num_dof != static_cast<int32_t>(num_dof_) || packet.fault.active)
-            return;
-        const double norm = std::hypot(std::hypot(packet.base_quat[0], packet.base_quat[1]),
-            std::hypot(packet.base_quat[2], packet.base_quat[3]));
-        if (!std::isfinite(norm) || norm <= 1.0e-6) return;
-        // HI91 time is device uptime, not ROS/system/steady time. Require actual
-        // device-time progress, even if the driver republishes faults with new seq.
-        // Establish a baseline before publishing, so a leftover SHM slot is ignored.
-        if (!have_device_time_)
-        {
-            device_time_ = packet.time;
-            have_device_time_ = true;
+            if (steady_now < next_connect_) return;
+            next_connect_ = steady_now + std::chrono::seconds(1);
+            try
+            {
+                humanoid_operator::Connect(&client_, connection_file_, "g1_body_tf", socket_timeout_ms_);
+                const auto reply = client_.SubscribeRobotFeedback();
+                if (!reply.ok) throw std::runtime_error("robot feedback subscription failed: " + reply.message);
+                RCLCPP_INFO(get_logger(), "Subscribed to remote G1 feedback (read-only)");
+            }
+            catch (const std::exception& error)
+            {
+                client_.Disconnect();
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "%s", error.what());
+            }
             return;
         }
-        if (packet.time == device_time_) return;
-        device_time_ = packet.time;
+        const auto feedback = client_.LatestRobotFeedback();
+        std::array<std::size_t, 3> indices{};
+        if (!feedback.available || !feedback.fresh || feedback.stream_id == 0 || feedback.sequence == 0 ||
+            !std::isfinite(feedback.age_ms) || feedback.age_ms < 0 || feedback.age_ms > state_timeout_ * 1000 ||
+            (have_feedback_ && feedback.stream_id == feedback_stream_ && feedback.sequence <= feedback_sequence_) ||
+            feedback.joint_positions.size() != feedback.joint_names.size() ||
+            !FindWaist(feedback.joint_names, &indices) || (publish_footprint_ && !feedback.has_base_imu))
+            return;
+        const std::array<double, 3> waist = {feedback.joint_positions[indices[0]],
+            feedback.joint_positions[indices[1]], feedback.joint_positions[indices[2]]};
+        // Device timestamps are not used as ROS stamps. New measurements are
+        // identified by the driver's stream/sequence, including after a restart.
+        if (!Publish(waist, feedback.orientation)) return;
+        have_feedback_ = true;
+        feedback_stream_ = feedback.stream_id;
+        feedback_sequence_ = feedback.sequence;
         last_progress_ = steady_now;
-        const auto stamp = now();  // ROS receipt time; camera driver uses the same host clock.
+    }
+
+    void Tick()
+    {
+        PollFeedback();
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - last_progress_).count() >
+            state_timeout_)
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                "Waiting for fresh remote G1 feedback; dynamic TF is paused");
+    }
+
+    bool Publish(const std::array<double, 3>& waist, const std::array<double, 4>& orientation)
+    {
+        if (std::any_of(waist.begin(), waist.end(), [](double angle) { return !std::isfinite(angle); }))
+            return false;
+        const double norm = std::hypot(std::hypot(orientation[0], orientation[1]),
+            std::hypot(orientation[2], orientation[3]));
+        if (publish_footprint_ && (!std::isfinite(norm) || norm <= 1.0e-6)) return false;
+        const auto stamp = now();  // Brain-local ROS time for every transform in this sample.
         std::vector<geometry_msgs::msg::TransformStamped> transforms;
         if (publish_footprint_)
         {
-            const tf2::Quaternion base(packet.base_quat[1] / norm, packet.base_quat[2] / norm,
-                packet.base_quat[3] / norm, packet.base_quat[0] / norm);
+            const tf2::Quaternion base(orientation[1] / norm, orientation[2] / norm,
+                orientation[3] / norm, orientation[0] / norm);
             const double yaw = std::atan2(2 * (base.w() * base.z() + base.x() * base.y()),
                 1 - 2 * (base.y() * base.y() + base.z() * base.z()));
             transforms.push_back(Transform(footprint_frame_, base_frame_, stamp,
@@ -284,26 +214,28 @@ private:
         }
         // URDF joint origin * joint axis rotation, including the roll pivot offset.
         transforms.push_back(Transform("pelvis", "waist_yaw_link", stamp, {0, 0, 0},
-            Rpy(0, 0, packet.joint_pos[waist_indices_[0]])));
+            Rpy(0, 0, waist[0])));
         transforms.push_back(Transform("waist_yaw_link", "waist_roll_link", stamp,
-            {-0.0039635, 0, 0.044}, Rpy(packet.joint_pos[waist_indices_[1]], 0, 0)));
+            {-0.0039635, 0, 0.044}, Rpy(waist[1], 0, 0)));
         transforms.push_back(Transform("waist_roll_link", "torso_link", stamp, {0, 0, 0},
-            Rpy(0, packet.joint_pos[waist_indices_[2]], 0)));
+            Rpy(0, waist[2], 0)));
         dynamic_tf_->sendTransform(transforms);
+        return true;
     }
 
-    std::unique_ptr<StateShmTap> state_tap_;
+    operator_service::Client client_;
+    std::string connection_file_;
+    int socket_timeout_ms_ = 600;
+    bool have_feedback_ = false;
+    uint64_t feedback_stream_ = 0, feedback_sequence_ = 0;
+    std::chrono::steady_clock::time_point next_connect_{};
     std::unique_ptr<tf2_ros::TransformBroadcaster> dynamic_tf_;
     std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_;
     rclcpp::TimerBase::SharedPtr timer_;
-    std::array<std::size_t, 3> waist_indices_{};
-    std::size_t num_dof_ = 0;
     std::string base_frame_, footprint_frame_, camera_frame_;
     double base_height_ = 0.793;
     double state_timeout_ = 0.1;
     bool publish_footprint_ = true;
-    bool have_device_time_ = false;
-    double device_time_ = 0.0;
     std::chrono::steady_clock::time_point last_progress_{};
 };
 
@@ -311,15 +243,15 @@ int main(int argc, char* argv[])
 {
     rclcpp::init(argc, argv);
     const auto args = rclcpp::remove_ros_arguments(argc, argv);
-    if (args.size() != 2 || args[1] == "-h" || args[1] == "--help")
+    if (args.size() != 1)
     {
-        fprintf(stderr, "Usage: %s <g1.yaml> [--ros-args <parameters>]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--ros-args -p connection_file:=<connection.json> <parameters>]\n", argv[0]);
         rclcpp::shutdown();
-        return args.size() == 2 ? 0 : 1;
+        return args.size() == 2 && (args[1] == "-h" || args[1] == "--help") ? 0 : 1;
     }
     try
     {
-        rclcpp::spin(std::make_shared<G1BodyTfNode>(args[1]));
+        rclcpp::spin(std::make_shared<G1BodyTfNode>());
     }
     catch (const std::exception& error)
     {
