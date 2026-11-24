@@ -292,16 +292,19 @@ ros2 run tf2_ros tf2_echo camera_link camera_color_optical_frame
 ### 依赖与输入
 
 除前述 native underlay 与本包外，运行环境还需 `rtabmap_slam`、`rtabmap_util`、
-`nav2_bringup`、`nav2_navfn_planner` 和 `nav2_regulated_pure_pursuit_controller`；
+`imu_complementary_filter`、`nav2_bringup`、`nav2_navfn_planner` 和
+`nav2_regulated_pure_pursuit_controller`；
 启用可视化时还需 `rtabmap_viz`。完整运行依赖见 [`package.xml`](package.xml)。
 
 启动前需由上游提供以下话题和 TF；实机默认使用系统时间 `use_sim_time:=false`：
 
 | 输入 | 要求 |
 | --- | --- |
-| `/camera/image_raw` | `sensor_msgs/msg/Image`，彩色图像 |
-| `/camera/depth/image_raw` | `sensor_msgs/msg/Image`，与彩色图像对齐的深度图 |
-| `/camera/camera_info` | `sensor_msgs/msg/CameraInfo`，对应对齐图像的内参 |
+| `/camera/color/image_raw` | `sensor_msgs/msg/Image`，彩色图像 |
+| `/camera/aligned_depth_to_color/image_raw` | `sensor_msgs/msg/Image`，与彩色图像对齐的深度图 |
+| `/camera/color/camera_info` | `sensor_msgs/msg/CameraInfo`，对应彩色图像的内参 |
+| `/camera/aligned_depth_to_color/camera_info` | `sensor_msgs/msg/CameraInfo`，深度点云转换使用的对齐内参 |
+| `/camera/imu` | `sensor_msgs/msg/Imu`，原始加速度和角速度；`use_imu:=true` 时使用 |
 | `/odom` | `nav_msgs/msg/Odometry`，连续的平面里程计 |
 | `odom -> base_footprint` | 外部里程计提供的动态 TF |
 | `base_footprint -> 相机 optical frame` | 本文机体／安装 TF 与相机驱动 TF 组成的完整链 |
@@ -312,13 +315,22 @@ ros2 run tf2_ros tf2_echo camera_link camera_color_optical_frame
 
 | RealSense 话题（上一节默认命名） | 本方案输入 |
 | --- | --- |
-| `/camera/camera/color/image_raw` | `/camera/image_raw` |
-| `/camera/camera/aligned_depth_to_color/image_raw` | `/camera/depth/image_raw` |
-| `/camera/camera/color/camera_info` | `/camera/camera_info` |
+| `/camera/camera/color/image_raw` | `/camera/color/image_raw` |
+| `/camera/camera/aligned_depth_to_color/image_raw` | `/camera/aligned_depth_to_color/image_raw` |
+| `/camera/camera/color/camera_info` | `/camera/color/camera_info` |
+| `/camera/camera/aligned_depth_to_color/camera_info` | `/camera/aligned_depth_to_color/camera_info` |
+| `/camera/camera/imu` | `/camera/imu` |
 
 必须使用对齐到彩色的深度图和对应内参；仅修改话题名不能完成图像对齐或时间同步。
-当前 launch 未暴露话题名和同步方式参数；需要其他接口时，调整
+当前 launch 可通过 `imu_raw_topic` 和 `imu_filtered_topic` 修改 IMU 话题；
+图像话题名和同步方式需调整
 [`g1_rgbd_slam.launch.py`](launch/g1_rgbd_slam.launch.py) 中的 remappings 与 parameters。
+
+默认 `use_imu:=true`，启动互补滤波器，将 `/camera/imu` 的原始加速度和角速度
+转换为 `/camera/imu_filtered` 上的姿态，再交给 RTAB-Map。滤波器不使用磁力计，
+开启自适应加速度增益和静稳零偏估计，输入 QoS 为 Best effort；它不发布 TF。
+IMU 消息保留原始 frame，仍需提供该 frame 到 `base_footprint` 的 TF。
+设置 `use_imu:=false` 会同时关闭滤波器、隔离 RTAB-Map 的 IMU 输入并禁用重力约束。
 
 实机 `g1_body_tf_node` 只提供身体倾斜和腰部／相机链，**不提供 `/odom` 或
 `odom -> base_footprint`**。本节 launch 也不启动 `rgbd_odometry`；需先接入并验证
@@ -352,6 +364,7 @@ ros2 launch humanoid g1_cmd_vel_bridge.launch.py
 
 ```text
 RGBD + /odom + TF -> RTAB-Map -> /map、map -> odom
+/camera/imu -> 互补滤波 -> /camera/imu_filtered -> RTAB-Map 重力约束
 深度图 -> /camera/cloud -> /camera/ground、/camera/obstacles -> Nav2 costmap
 Nav2 -> velocity_smoother -> /cmd_vel -> g1_cmd_vel_bridge -> native operator 服务
 ```
@@ -364,11 +377,12 @@ Nav2 -> velocity_smoother -> /cmd_vel -> g1_cmd_vel_bridge -> native operator �
 
 | launch | 参数与默认值 |
 | --- | --- |
-| `g1_rgbd_slam.launch.py` | `use_sim_time:=false`、`localization:=false`、`start_viz:=false`、`database_path:=$HOME/.ros/g1_rgbd_textured_map.db` |
+| `g1_rgbd_slam.launch.py` | `use_sim_time:=false`、`localization:=false`、`use_imu:=true`、`imu_raw_topic:=/camera/imu`、`imu_filtered_topic:=/camera/imu_filtered`、`imu_gain_acc:=0.01`、`imu_gravity_sigma:=0.3`、`start_viz:=false`、`database_path:=$HOME/.ros/g1_rgbd_map.db` |
 | `g1_rgbd_nav2.launch.py` | `use_sim_time:=false`、`params:=<humanoid 安装目录>/config/g1_rgbd_nav2_params.yaml` |
 
-数据库默认路径在启动时展开为当前用户的绝对路径，不会自动删除已有数据库。
-新建地图时指定新的数据库路径；实机和仿真应分别保存。正常退出建图后，用同一数据库
+数据库默认路径在启动时展开为当前用户的绝对路径。SLAM 模式启动时会清空
+`database_path` 指定的数据库并重新建图；定位模式保留并加载已有数据库。
+实机和仿真应分别保存。正常退出建图后，用同一数据库
 进入定位模式，再单独启动上述 Nav2 与速度桥：
 
 ```bash
