@@ -82,6 +82,14 @@ Wi-Fi 地址不可直达时，可建立 `ssh -N -L 15560:192.168.60.1:5560 bianb
 | --- | --- |
 | `g1-realsense.service` | 按上述相机基线采集 RGB、深度和 IMU |
 | `g1-hiking-depth.service` | 启动正式桥接和时间同步，同时拉起相机服务 |
+| `g1-camera-preview.service` | 按网页请求从已有彩色及对齐深度话题采样，不参与策略推理 |
+
+需要网页图传时，在导航板安装同目录的 `g1-camera-preview.service`，执行
+`sudo systemctl daemon-reload` 和 `sudo systemctl enable --now g1-camera-preview.service`。
+手机连运控板热点，打开已配对的遥控页；实机进入 Hiking 后显示彩色和深度，
+退出自动关闭。深度以 2.5 m 为显示上限，黑色为无效像素；显示的是相机全幅而非策略裁剪区。
+预览端口 5562 仅绑定导航板内网地址，仅接受运控板请求。更换网段时同步修改
+unit 的 `--bind`、`--peer` 和机型 `operator_service.camera_preview`。
 
 首次安装：
 

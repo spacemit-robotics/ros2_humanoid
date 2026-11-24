@@ -1,0 +1,19 @@
+[Unit]
+Description=G1 on-demand operator RGB-D preview
+Wants=network-online.target g1-realsense.service
+After=network-online.target g1-realsense.service
+
+[Service]
+Type=simple
+User=bianbu
+Group=bianbu
+Environment=ROS_DOMAIN_ID=73
+WorkingDirectory=/home/bianbu/spacemit_robot
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec /usr/bin/python3 middleware/ros2/control/humanoid/scripts/rgbd_web_preview.py --bind 192.168.60.1 --peer 192.168.60.153'
+Restart=on-failure
+RestartSec=5
+Nice=10
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target
