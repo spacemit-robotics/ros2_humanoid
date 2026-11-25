@@ -9,7 +9,7 @@ User=bianbu
 Group=bianbu
 Environment=ROS_DOMAIN_ID=73
 WorkingDirectory=/home/bianbu/spacemit_robot
-ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec /usr/bin/python3 middleware/ros2/control/humanoid/scripts/rgbd_web_preview.py --bind 192.168.60.1 --peer 192.168.60.153'
+ExecStart=/usr/local/bin/mediamtx /home/bianbu/spacemit_robot/middleware/ros2/control/humanoid/scripts/systemd/g1-camera-preview.yml
 Restart=on-failure
 RestartSec=5
 Nice=10

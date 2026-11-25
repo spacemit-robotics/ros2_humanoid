@@ -1,0 +1,24 @@
+# Navigation board: reuse the running ROS camera. Only the control board can pull RTSP.
+logLevel: warn
+rtspAddress: 192.168.60.1:18554
+rtspTransports: [tcp]
+webrtc: no
+rtmp: no
+hls: no
+srt: no
+authInternalUsers:
+  - user: any
+    ips: [192.168.60.1]
+    permissions: [{action: publish, path: hiking}]
+  - user: any
+    ips: [192.168.60.153]
+    permissions: [{action: read, path: hiking}]
+paths:
+  hiking:
+    runOnDemandCloseAfter: 1s
+    runOnDemand: >-
+      bash -o pipefail -c 'source /opt/ros/humble/setup.bash &&
+      /usr/bin/python3 -u middleware/ros2/control/humanoid/scripts/rgbd_web_preview.py |
+      ffmpeg -hide_banner -loglevel error -f rawvideo -pixel_format bgr24 -video_size 640x180
+      -framerate 30 -i pipe:0 -an -vf format=nv12 -c:v h264_stcodec -b:v 1500k -g 15 -bf 0
+      -flush_packets 1 -f rtsp -rtsp_transport tcp rtsp://192.168.60.1:18554/hiking'
