@@ -1,0 +1,20 @@
+[Unit]
+Description=G1 on-demand operator RGB-D preview
+Wants=network-online.target g1-realsense.service
+After=network-online.target g1-realsense.service
+
+[Service]
+Type=simple
+User=bianbu
+Group=bianbu
+SupplementaryGroups=video
+Environment=ROS_DOMAIN_ID=73
+WorkingDirectory=/home/bianbu/spacemit_robot
+ExecStart=/usr/local/bin/mediamtx /home/bianbu/spacemit_robot/middleware/ros2/control/humanoid/scripts/systemd/g1-camera-preview.yml
+Restart=on-failure
+RestartSec=5
+Nice=10
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

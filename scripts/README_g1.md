@@ -82,6 +82,15 @@ Wi-Fi 地址不可直达时，可建立 `ssh -N -L 15560:192.168.60.1:5560 bianb
 | --- | --- |
 | `g1-realsense.service` | 按上述相机基线采集 RGB、深度和 IMU |
 | `g1-hiking-depth.service` | 启动正式桥接和时间同步，同时拉起相机服务 |
+| `g1-camera-preview.service` | 按网页请求从已有彩色及对齐深度话题采样，不参与策略推理 |
+
+网页图传使用已有的 ROS 彩色和对齐深度话题，不再打开 USB 相机。导航板需装
+`/usr/local/bin/mediamtx`、带 `h264_stcodec` 的 FFmpeg、cv_bridge 和 Python OpenCV。
+安装下方 unit 后执行 `sudo systemctl enable --now g1-camera-preview.service`。
+MediaMTX 仅在运控板请求视频时拉起采集和硬编码进程。彩色和深度并排输出 H.264，
+目标 30 FPS、1.5 Mbps；深度以 2.5 m 为显示上限，不是策略裁剪图。
+导航板在板间地址 192.168.60.1:18554 提供 RTSP，只允许运控板 192.168.60.153 读取。
+更换网段需同步更新 `scripts/systemd/g1-camera-preview.yml` 和机型的 `camera_preview.real_rtsp`。
 
 首次安装：
 
