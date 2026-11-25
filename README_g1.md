@@ -377,8 +377,15 @@ Nav2 -> velocity_smoother -> /cmd_vel -> g1_cmd_vel_bridge -> native operator �
 
 | launch | 参数与默认值 |
 | --- | --- |
-| `g1_rgbd_slam.launch.py` | `use_sim_time:=false`、`localization:=false`、`use_imu:=true`、`imu_raw_topic:=/camera/imu`、`imu_filtered_topic:=/camera/imu_filtered`、`imu_gain_acc:=0.01`、`imu_gravity_sigma:=0.3`、`start_viz:=false`、`database_path:=$HOME/.ros/g1_rgbd_map.db` |
+| `g1_rgbd_slam.launch.py` | `use_sim_time:=false`、`localization:=false`、`odom_tf_linear_variance:=0.0001`、`odom_tf_angular_variance:=0.0001`、`use_imu:=true`、`imu_raw_topic:=/camera/imu`、`imu_filtered_topic:=/camera/imu_filtered`、`imu_gain_acc:=0.01`、`imu_gravity_sigma:=0.3`、`start_viz:=false`、`database_path:=$HOME/.ros/g1_rgbd_map.db` |
 | `g1_rgbd_nav2.launch.py` | `use_sim_time:=false`、`params:=<humanoid 安装目录>/config/g1_rgbd_nav2_params.yaml` |
+
+当前 `odom_frame_id=odom`，RTAB-Map 从 TF 获取里程计，不读取 `/odom` 消息中的协方差。
+`odom_tf_linear_variance` 的单位为 m²，`odom_tf_angular_variance` 的单位为 rad²；
+方差越小，图优化越信任外部里程计。默认均为 `0.0001`，相对 RTAB-Map 默认
+`0.001` 将里程计约束权重提高约 10 倍。SLAM 和定位模式均显式设置
+`Optimizer/VarianceIgnored=false`，保留方差权重。回环检测与拒绝阈值保持原值，
+便于单独评估里程计权重的影响。
 
 数据库默认路径在启动时展开为当前用户的绝对路径。SLAM 模式启动时会清空
 `database_path` 指定的数据库并重新建图；定位模式保留并加载已有数据库。

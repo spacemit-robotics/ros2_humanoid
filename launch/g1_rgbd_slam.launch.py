@@ -52,9 +52,17 @@ def generate_launch_description():
         'Mem/SaveDepth16Format': 'true',
     }
 
-    # IMU 只供 SLAM/定位节点使用，需要有效姿态及到 base_footprint 的 TF。
+    # SLAM/定位专用参数：从 TF 获取外部里程计，并使用滤波后的 IMU 姿态。
     slam_parameters = {
         **parameters,
+        # 方差越小，优化时越信任外部 LIO；分别使用 m^2 和 rad^2。
+        'odom_tf_linear_variance': ParameterValue(
+            LaunchConfiguration('odom_tf_linear_variance'), value_type=float),
+        'odom_tf_angular_variance': ParameterValue(
+            LaunchConfiguration('odom_tf_angular_variance'), value_type=float),
+        'Optimizer/VarianceIgnored': 'false',
+
+        # IMU 需要有效姿态及到 base_footprint 的 TF。
         'qos_imu': 2,  # Best effort，兼容相机常用的 IMU 发布 QoS。
         'Optimizer/GravitySigma': ParameterValue(
             PythonExpression([
@@ -89,6 +97,14 @@ def generate_launch_description():
 
         DeclareLaunchArgument(
             'localization', default_value='false'),
+
+        DeclareLaunchArgument(
+            'odom_tf_linear_variance', default_value='0.0001',
+            description='TF odometry translation variance in m^2; smaller values increase trust.'),
+
+        DeclareLaunchArgument(
+            'odom_tf_angular_variance', default_value='0.0001',
+            description='TF odometry rotation variance in rad^2; smaller values increase trust.'),
 
         DeclareLaunchArgument(
             'use_imu', default_value='true',
