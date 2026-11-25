@@ -7,6 +7,7 @@ After=network-online.target g1-realsense.service
 Type=simple
 User=bianbu
 Group=bianbu
+SupplementaryGroups=video
 Environment=ROS_DOMAIN_ID=73
 WorkingDirectory=/home/bianbu/spacemit_robot
 ExecStart=/usr/local/bin/mediamtx /home/bianbu/spacemit_robot/middleware/ros2/control/humanoid/scripts/systemd/g1-camera-preview.yml
