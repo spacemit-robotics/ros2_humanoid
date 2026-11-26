@@ -74,6 +74,58 @@ Wi-Fi 地址不可直达时，可建立 `ssh -N -L 15560:192.168.60.1:5560 bianb
 桥接将原始深度映射为 SDK 相机投影的 `64×36`、58.29° 深度，单位为米，保留光轴 Z 距离和空洞。
 它按实际到帧发布，约 30 FPS；裁剪、补洞和滤波由 control 完成，策略按 50 Hz 推理。
 
+### PC 直接查看远端彩色和对齐深度
+
+发布端与查看器分别运行，启动、控制及图像传输均不依赖 SSH。
+将同一版本的 `view_remote_rgbd.py` 放到远端 SDK 的 `scripts` 目录。
+以下命令均从各自的 `spacemit_robot` 根目录执行。
+
+```bash
+# 远端相机主机：启动独立发布端
+source /opt/ros/humble/setup.bash
+python3 middleware/ros2/control/humanoid/scripts/view_remote_rgbd.py --publish
+
+# 本机图形桌面：直接连接 ZeroMQ，无需本机 ROS 环境
+python3 middleware/ros2/control/humanoid/scripts/view_remote_rgbd.py
+```
+
+发布端在 `ROS_DOMAIN_ID=73` 订阅 `/camera/color/image_raw` 和
+`/camera/aligned_depth_to_color/image_raw`，压缩成 JPEG 后通过 ZeroMQ PUB/SUB
+直传本机。远端默认监听 `tcp://0.0.0.0:5562`，本机默认连接
+`tcp://10.0.91.110:5562`，需要本机能访问远端 TCP 5562 端口。
+远端需要 ROS Humble、`rclpy`、`cv_bridge`、`message_filters`、OpenCV、NumPy 和
+`python3-zmq`，本机只需 OpenCV、NumPy 和 `python3-zmq`。
+
+默认对两幅对齐图像使用相同位置的中心裁剪，每侧 **`640×360`**，并排共 **`1280×360`**，
+左侧彩色、右侧深度伪彩色；以 **10 Hz** 采样并传输 JPEG，输入不足 10 Hz 时按实际帧率输出。
+配对时间差不超过 50 ms，发送端和接收端均启用 ZeroMQ `CONFLATE`，整帧作为单条消息，
+仅保留最新帧。窗口卡顿时跳过旧帧，窗口和终端均不显示帧率统计。
+深度色标默认为 3 m，近红远蓝、无效黑色，支持毫米单位 `16UC1` 和米单位 `32FC1`。
+色标上限随图像传输，本机窗口显示发布端实际使用的上限。
+
+```bash
+# 远端：保留完整视野，缩放到每侧 640×360
+python3 middleware/ros2/control/humanoid/scripts/view_remote_rgbd.py --publish --mode resize
+
+# 远端：降低 JPEG 质量以节约带宽，保持分辨率和 10 Hz
+python3 middleware/ros2/control/humanoid/scripts/view_remote_rgbd.py --publish --quality 60
+
+# 远端：更改域、端口、色标或传输帧率
+python3 middleware/ros2/control/humanoid/scripts/view_remote_rgbd.py \
+  --publish --domain 73 --port 5562 --max-depth 3 --fps 10
+
+# 本机：指定发布端地址与端口
+python3 middleware/ros2/control/humanoid/scripts/view_remote_rgbd.py \
+  --host 10.0.91.110 --port 5562
+
+# 本机：无窗口接收 10 秒，并保存最后一帧
+python3 middleware/ros2/control/humanoid/scripts/view_remote_rgbd.py \
+  --headless --duration 10 --save-frame /tmp/g1_rgbd_preview.jpg
+```
+
+本机按 `Q`、`Esc` 或关闭窗口退出，发布端继续运行，可重新打开查看器连接。
+停止发布端请在远端终端按 `Ctrl+C`。查看器在发布端暂时不可用时等待并自动重连。
+
 ## 大脑开机自启
 
 使用两个服务代替手动启动，两种方式选一。默认用户为 `bianbu`，SDK 位于 `/home/bianbu/spacemit_robot`。
