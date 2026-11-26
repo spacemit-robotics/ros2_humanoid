@@ -148,6 +148,7 @@ MediaMTX 仅在运控板请求视频时拉起采集和硬编码进程。彩色�
 
 ```bash
 cd /home/bianbu/spacemit_robot
+sudo cmake -DCMAKE_INSTALL_PREFIX=/usr/local -P application/native/humanoid_unitree_g1/cmake/InstallMediaMTX.cmake
 sudo install -m 644 middleware/ros2/control/humanoid/scripts/systemd/g1-*.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now g1-realsense.service g1-hiking-depth.service
