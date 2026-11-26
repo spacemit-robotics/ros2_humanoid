@@ -28,11 +28,15 @@ class G1CmdVelBridge : public rclcpp::Node {
 public:
     G1CmdVelBridge() : Node("g1_cmd_vel_bridge") {
         const auto topic = declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel");
+        min_angular_velocity_ = declare_parameter<double>("min_angular_velocity", 0.3);
         timeout_s_ = declare_parameter<double>("cmd_vel_timeout_s", 0.2);
         release_timeout_s_ = declare_parameter<double>("control_release_timeout_s", 5.0);
         const auto rate = declare_parameter<double>("publish_rate_hz", 10.0);
         const auto ttl = declare_parameter<int64_t>("velocity_ttl_ms", 300);
         const auto socket_timeout = declare_parameter<int64_t>("socket_timeout_ms", 300);
+        if (!std::isfinite(min_angular_velocity_) || min_angular_velocity_ < 0.0) {
+            throw std::invalid_argument("min_angular_velocity must be finite and nonnegative");
+        }
         if (!std::isfinite(timeout_s_) || timeout_s_ <= 0.0 || !std::isfinite(rate) || rate < 1.0 || rate > 50.0 ||
             ttl < 50 || ttl > 1000 || 1000.0 / rate >= ttl || socket_timeout < 100 || socket_timeout > 10000) {
             throw std::invalid_argument("require finite cmd_vel_timeout_s > 0, publish_rate_hz in [1, 50], "
@@ -78,6 +82,9 @@ private:
             return;
         }
         target_ = {message.linear.x, message.linear.y, message.angular.z};
+        if (target_.wz != 0.0 && std::abs(target_.wz) < min_angular_velocity_) {
+            target_.wz = std::copysign(min_angular_velocity_, target_.wz);
+        }
         last_command_ = Clock::now();
         have_command_ = true;
     }
@@ -191,6 +198,7 @@ private:
     bool have_command_ = false;
     bool lease_acquired_ = false;
     double timeout_s_ = 0.2;
+    double min_angular_velocity_ = 0.3;
     double release_timeout_s_ = 5.0;
     int velocity_ttl_ms_ = 300;
     int socket_timeout_ms_ = 300;

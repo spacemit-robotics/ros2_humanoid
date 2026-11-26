@@ -10,6 +10,8 @@ from launch_ros.parameter_descriptions import ParameterValue
 def generate_launch_description():
     parameters = [
         ('cmd_vel_topic', '/cmd_vel', str),
+        # Minimum magnitude for nonzero angular.z in rad/s; zero remains zero.
+        ('min_angular_velocity', '0.3', float),
         # Zero velocity after this interval without a new cmd_vel; retain the lease.
         ('cmd_vel_timeout_s', '0.2', float),
         # Release control after this interval since the same last cmd_vel.

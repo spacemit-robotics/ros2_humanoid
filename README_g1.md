@@ -82,6 +82,10 @@ ros2 topic pub --rate 10 /cmd_vel geometry_msgs/msg/Twist \
   300 ms；launch 将这两项覆盖为 600 ms。
 - 订阅 `geometry_msgs/msg/Twist`，只取 `linear.x/y` 和 `angular.z`；QoS 为
   best effort、volatile、深度 1，兼容可靠和 best effort 发布者。
+- `min_angular_velocity` 默认 `0.3 rad/s`：将非零角速度的绝对值提高到至少该值，
+  保留输入符号，例如 `0.1 → 0.3`、`-0.1 → -0.3`；零输入仍为零，较大角速度不变。
+  该规则对原地和行进中的转向均生效，线速度不变；超时清零和其他门控仍然有效。
+  设为 `0.0` 可关闭起转补偿，最终速度仍受 native 当前策略的限幅约束。
 
 查看当前门控状态：
 
@@ -90,7 +94,7 @@ ros2 topic echo /g1_cmd_vel_bridge/status
 ```
 
 全部参数及默认值定义在 [`launch/g1_cmd_vel_bridge.launch.py`](launch/g1_cmd_vel_bridge.launch.py)，
-可通过同名 launch 参数覆盖：`cmd_vel_topic`、`cmd_vel_timeout_s`、`control_release_timeout_s`、`publish_rate_hz`、
+可通过同名 launch 参数覆盖：`cmd_vel_topic`、`min_angular_velocity`、`cmd_vel_timeout_s`、`control_release_timeout_s`、`publish_rate_hz`、
 `velocity_ttl_ms`、`socket_timeout_ms`、`connection_file`、`robot_config_path`，例如：
 
 ```bash
